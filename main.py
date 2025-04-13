@@ -1,10 +1,15 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import google.generativeai as genai
+import fitz
 import json
 import os
 import io
 import PyPDF2
 import asyncio
+from PIL import Image
+import base64
+import tempfile
+import time
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -34,29 +39,31 @@ async def extract_pdf(pdf: UploadFile = File(...)):
     try:
         pdf_content = await pdf.read()
         
-        # Extract text from PDF using PyPDF2
+        # Use the enhanced extraction function with Gemini fallback for scanned documents
+        extracted_text = await extract_pdf_text(pdf_content)
+        
+        # For diagnostics, still create a PDF reader
         pdf_file = io.BytesIO(pdf_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         
-        # Extract text from all pages
-        extracted_text = ""
-        page_details = []
+        # Get extraction quality stats
+        extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
         
+        # Check if Gemini was used for extraction
+        avg_chars_per_page = len(extracted_text) / len(pdf_reader.pages) if len(pdf_reader.pages) > 0 else 0
+        used_gemini = avg_chars_per_page < 200 and len(extracted_text.strip()) > 0
+        
+        # Track per-page stats (from the original PDF, not the enhanced extraction)
+        page_details = []
         for page_num in range(len(pdf_reader.pages)):
             page = pdf_reader.pages[page_num]
             page_text = page.extract_text() or ""
-            extracted_text += page_text + "\n\n"
-            
-            # Track per-page stats
             page_details.append({
                 "page_number": page_num + 1,
                 "characters": len(page_text),
                 "words": len(page_text.split()) if page_text else 0,
                 "empty": len(page_text.strip()) == 0
             })
-        
-        # Check extraction quality
-        extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
         
         # Get sample text (first 1000 chars)
         text_sample = extracted_text[:1000] + "..." if len(extracted_text) > 1000 else extracted_text
@@ -68,7 +75,8 @@ async def extract_pdf(pdf: UploadFile = File(...)):
             "text_sample": text_sample,
             "text_length": len(extracted_text),
             "page_count": len(pdf_reader.pages),
-            "empty_pages": sum(1 for page in page_details if page["empty"])
+            "empty_pages": sum(1 for page in page_details if page["empty"]),
+            "used_gemini_ocr": used_gemini
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error extracting PDF: {str(e)}")
@@ -135,42 +143,52 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
     Makes individual Gemini API requests for each index to ensure focused evaluation.
     Includes token usage information for API monitoring.
     """
+    # Track overall processing time
+    start_time = time.time()
+
     try:
         pdf_content = await pdf.read()
+
+        # Use the enhanced extraction function
+        extracted_text = await extract_pdf_text(pdf_content)
+        
+        # Track extraction time
+        extraction_start = time.time()
+        extracted_text = await extract_pdf_text(pdf_content)
+        extraction_time = time.time() - extraction_start
         
         # Extract text from PDF using PyPDF2 instead of Gemini API
         pdf_file = io.BytesIO(pdf_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
-        
-        # Extract text from all pages
-        extracted_text = ""
-        for page_num in range(len(pdf_reader.pages)):
-            page = pdf_reader.pages[page_num]
-            page_text = page.extract_text()
-            if page_text:  # Some pages might return None
-                extracted_text += page_text + "\n\n"
-                
+
         # Check extraction quality
         extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
         
         if not extraction_quality["extraction_success"]:
-            # You could either return a warning or raise an error depending on severity
-            # Here we'll include a warning in the response but continue processing
             extraction_warning = f"Warning: PDF extraction issues detected: {', '.join(extraction_quality['extraction_issues'])}"
         else:
             extraction_warning = None
         
-        # Rest of your existing code remains the same...
         # Track token usage across all evaluations
         total_tokens_used = 0
         token_usage_by_indicator = {}
+
+        # Track AI processing times for each indicator
+        ai_processing_times = {}
         
         # Evaluate against all indicators with individual API calls for each index
         results = {}
         for indicator_code, indicator in scoring_rules.items():
             try:
                 await asyncio.sleep(1)  # Rate limiting for API calls
+
+                # Track time for this specific indicator
+                indicator_start = time.time()
                 score, reasoning, token_count = await evaluate_indicator(extracted_text, indicator_code, indicator)
+                indicator_time = time.time() - indicator_start
+                
+                # Store timing information
+                ai_processing_times[indicator_code] = round(indicator_time, 2)
                 
                 # Store token usage information
                 token_usage_by_indicator[indicator_code] = token_count
@@ -179,7 +197,7 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
                 
                 results[indicator_code] = {
                     "score": score,
-                    "reasoning": reasoning,  # Include reasoning in results
+                    "reasoning": reasoning,
                     "title": indicator["disclosure"],
                     "type": indicator["types"],
                     "sub_type": indicator["sub-title"],
@@ -207,7 +225,18 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
         
         # Calculate summary scores by category
         summary = calculate_summary_scores(results)
+
+         # Calculate total processing time
+        total_time = time.time() - start_time
         
+        # Add timing metrics to response
+        timing_metrics = {
+            "total_processing_time_seconds": round(total_time, 2),
+            "extraction_time_seconds": round(extraction_time, 2),
+            "ai_evaluation_time_seconds": round(sum(ai_processing_times.values()), 2),
+            "indicator_processing_times": ai_processing_times
+        }
+
         return {
             "filename": pdf.filename,
             "extraction_quality": extraction_quality,
@@ -217,9 +246,12 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
             "token_usage": {
                 "total_tokens_used": total_tokens_used,
                 "by_indicator": token_usage_by_indicator
-            }
+            },
+            "performance_metrics": timing_metrics  # Add timing metrics to response
         }
     except Exception as e:
+        # Calculate time even for errors
+        error_time = time.time() - start_time
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
 
 async def evaluate_indicator(text, indicator_code, indicator):
@@ -363,6 +395,77 @@ def calculate_summary_scores(results):
     summary["overall"] = round(total_scores / total_indicators, 2) if total_indicators > 0 else 0
     
     return summary
+
+async def extract_pdf_text(pdf_content):
+    """Extract text from PDF with fallback to Gemini for scanned documents"""
+    # First try conventional extraction with PyPDF2
+    pdf_file = io.BytesIO(pdf_content)
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    
+    # Extract text using PyPDF2
+    extracted_text = ""
+    for page_num in range(len(pdf_reader.pages)):
+        page = pdf_reader.pages[page_num]
+        page_text = page.extract_text() or ""
+        extracted_text += page_text + "\n\n"
+    
+    # Check if this is likely a scanned document
+    avg_chars_per_page = len(extracted_text) / len(pdf_reader.pages) if len(pdf_reader.pages) > 0 else 0
+    
+    # If it's a scanned document (low character count), use Gemini's image processing
+    if avg_chars_per_page < 200:
+        print(f"Detected potential scanned PDF (avg {avg_chars_per_page:.2f} chars per page). Using Gemini for image processing...")
+        
+        # Save PDF content to a temporary file (required for PyMuPDF)
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
+            temp_pdf.write(pdf_content)
+            temp_pdf_path = temp_pdf.name
+        
+        try:
+            # Extract images from PDF using PyMuPDF
+            doc = fitz.open(temp_pdf_path)
+            gemini_text = ""
+            
+            # Configure Gemini model for image processing
+            model = genai.GenerativeModel('gemini-1.5-pro')
+            
+            # Process each page as an image
+            for page_num in range(len(doc)):
+                # Convert PDF page to image
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scaling for better quality
+                
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                
+                # Convert image to base64 for Gemini
+                buffered = io.BytesIO()
+                img.save(buffered, format="PNG")
+                img_bytes = buffered.getvalue()
+                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                
+                # Process with Gemini (with rate limiting)
+                try:
+                    await asyncio.sleep(1)  # Rate limiting
+                    response = await model.generate_content_async([
+                        "Extract all text visible in this image. Format as plain text with paragraphs preserved.",
+                        {"mime_type": "image/png", "data": img_base64}
+                    ])
+                    gemini_text += response.text + "\n\n"
+                except Exception as e:
+                    print(f"Error processing page {page_num+1} with Gemini: {e}")
+            
+            # Clean up temporary file
+            import os
+            os.unlink(temp_pdf_path)
+            
+            # If Gemini extracted text, use it. Otherwise, fall back to PyPDF2 results
+            if len(gemini_text.strip()) > len(extracted_text.strip()):
+                return gemini_text
+        except Exception as e:
+            print(f"Error in image-based extraction: {e}")
+    
+    # Return the best text we have (either PyPDF2 or Gemini)
+    return extracted_text
 
 # Utility endpoints
 @app.get("/scoring-rules")
