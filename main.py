@@ -1,3 +1,4 @@
+from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import google.generativeai as genai
 import fitz
@@ -367,6 +368,311 @@ async def evaluate_indicator(text, indicator_code, indicator):
     except Exception as e:
         return 0, f"Error: {str(e)}", {"total_tokens": prompt_token_count, "prompt_tokens": prompt_token_count, "response_tokens": 0}
 
+@app.post("/evaluate-multi")
+async def evaluate_multi_documents(
+    files: List[UploadFile] = File(...),
+    document_types: Optional[List[str]] = None
+):
+    """Process multiple documents with optional type classification"""
+    # Track overall processing time
+    start_time = time.time()
+    
+    documents = []
+    
+    # Track extraction time
+    extraction_start = time.time()
+    # Process each document
+    for i, file in enumerate(files):
+        content = await file.read()
+        
+        # Extract text from the document
+        extracted_text = await extract_pdf_text(content)
+        
+        # Auto-classify document if type not provided
+        doc_type = document_types[i] if document_types and i < len(document_types) else None
+        if not doc_type:
+            doc_type = classify_document_type(extracted_text)
+            
+        documents.append({
+            "filename": file.filename,
+            "text": extracted_text,
+            "type": doc_type
+        })
+    
+    extraction_time = time.time() - extraction_start
+    
+    # Track token usage across all evaluations
+    total_tokens_used = 0
+    token_usage_by_indicator = {}
+    
+    # Track AI processing times for each indicator
+    ai_processing_times = {}
+    
+    # Build context for each indicator based on document types
+    results = {}
+    for indicator_code, indicator in scoring_rules.items():
+        # Track time for this specific indicator
+        indicator_start = time.time()
+        
+        # Select appropriate document or documents for this indicator
+        context = build_indicator_context(documents, indicator)
+        
+        # Evaluate the indicator with the selected context
+        score, reasoning, token_count = await evaluate_indicator_with_context(context, indicator_code, indicator)
+        
+        # Calculate and store processing time
+        indicator_time = time.time() - indicator_start
+        ai_processing_times[indicator_code] = round(indicator_time, 2)
+        
+        # Store token usage information
+        token_usage_by_indicator[indicator_code] = token_count
+        if token_count["total_tokens"]:
+            total_tokens_used += token_count["total_tokens"]
+        
+        # Store results
+        results[indicator_code] = {
+            "score": score,
+            "reasoning": reasoning,
+            "source_documents": context["source_documents"],
+            "title": indicator["disclosure"],
+            "type": indicator["types"],
+            "sub_type": indicator.get("sub-title", "Unknown"),
+            "description": indicator.get("description", ""),
+            "token_usage": token_count
+        }
+    
+    # Calculate summary scores by category
+    summary = calculate_summary_scores(results)
+    
+    # Calculate total processing time
+    total_time = time.time() - start_time
+    
+    # Add timing metrics to response
+    timing_metrics = {
+        "total_processing_time_seconds": round(total_time, 2),
+        "extraction_time_seconds": round(extraction_time, 2),
+        "ai_evaluation_time_seconds": round(sum(ai_processing_times.values()), 2),
+        "indicator_processing_times": ai_processing_times
+    }
+    
+    return {
+        "documents": [{"filename": doc["filename"], "type": doc["type"]} for doc in documents],
+        "indicators": results,
+        "summary": summary,
+        "token_usage": {
+            "total_tokens_used": total_tokens_used,
+            "by_indicator": token_usage_by_indicator
+        },
+        "performance_metrics": timing_metrics
+    }
+
+def classify_document_type(text):
+    """Classify document type based on content analysis"""
+    # Simple rule-based classification
+    text_lower = text.lower()
+    
+    # Check for sustainability report indicators
+    sustainability_terms = ["sustainability report", "esg report", "environmental, social", 
+                          "carbon footprint", "greenhouse gas emissions", "gri standards"]
+    sustainability_score = sum(1 for term in sustainability_terms if term in text_lower)
+    
+    # Check for annual report indicators
+    annual_report_terms = ["annual report", "financial year", "dear shareholders", 
+                         "board of directors", "financial statements", "corporate governance"]
+    annual_report_score = sum(1 for term in annual_report_terms if term in text_lower)
+    
+    # Check for financial statement indicators
+    financial_terms = ["balance sheet", "income statement", "cash flow statement", 
+                     "statement of financial position", "notes to financial statements"]
+    financial_score = sum(1 for term in financial_terms if term in text_lower)
+    
+    # Determine document type based on highest score
+    max_score = max(sustainability_score, annual_report_score, financial_score)
+    
+    if max_score == 0:
+        return "unknown"
+    elif max_score == sustainability_score:
+        return "sustainability_report"
+    elif max_score == annual_report_score:
+        return "annual_report"
+    else:
+        return "financial_statement"
+
+def build_indicator_context(documents, indicator):
+    """
+    Build evaluation context for an indicator by selecting appropriate document(s).
+    
+    Args:
+        documents: List of extracted documents with their types
+        indicator: The indicator to evaluate
+    
+    Returns:
+        dict: Context object with text to evaluate and metadata
+    """
+    indicator_type = indicator["types"]  # governance, environmental, etc.
+    indicator_code = indicator.get("sub-title", "")
+    
+    # Initialize context
+    context = {
+        "combined_text": "",
+        "source_documents": []
+    }
+    
+    # Document type preference map for indicator types
+    preference_map = {
+        "governance": ["sustainability_report", "annual_report", "financial_statement"],
+        "environmental": ["sustainability_report", "annual_report"],
+        "social": ["sustainability_report", "annual_report"],
+        "economic": ["financial_statement", "annual_report", "sustainability_report"]
+    }
+    
+    # Get ordered preference for this indicator type
+    preferences = preference_map.get(indicator_type, ["sustainability_report", "annual_report", "financial_statement"])
+    
+    # First try to find ideal document type for this indicator
+    primary_docs = [doc for doc in documents if doc["type"] in preferences[:1]]
+    
+    # If no primary document found, use the preference order
+    if not primary_docs:
+        for pref in preferences:
+            docs_of_type = [doc for doc in documents if doc["type"] == pref]
+            if docs_of_type:
+                primary_docs = docs_of_type
+                break
+    
+    # If still no document found, use any available document
+    if not primary_docs and documents:
+        primary_docs = [documents[0]]
+    
+    # Build combined text from selected document(s)
+    all_text = ""
+    for doc in primary_docs:
+        context["source_documents"].append(doc["filename"])
+        all_text += doc["text"] + "\n\n"
+    
+    context["combined_text"] = all_text
+    return context
+
+async def evaluate_indicator_with_context(context, indicator_code, indicator):
+    """
+    Evaluate an indicator using context built from multiple documents.
+    
+    Args:
+        context: Context object with text and metadata
+        indicator_code: Code of the indicator to evaluate
+        indicator: The indicator configuration
+        
+    Returns:
+        tuple: (score, reasoning, token_count)
+    """
+    combined_text = context["combined_text"]
+    
+    # If no text is available, return a default score
+    if not combined_text.strip():
+        return 0, "No relevant text found in provided documents.", {"total_tokens": 0, "prompt_tokens": 0, "response_tokens": 0}
+    
+    # Find relevant sections based on keywords (similar to evaluate_indicator)
+    keywords = indicator['keywords']
+    relevant_sections = []
+    text_lower = combined_text.lower()
+    
+    # Try to find sections containing keywords
+    for keyword in keywords:
+        keyword_lower = keyword.lower()
+        if keyword_lower in text_lower:
+            # Find position of keyword
+            index = text_lower.find(keyword_lower)
+            # Extract surrounding context (2000 chars before and after)
+            start = max(0, index - 2000)
+            end = min(len(combined_text), index + 2000)
+            relevant_sections.append(combined_text[start:end])
+            
+            # Look for more instances if document is large
+            if len(combined_text) > 10000:
+                # Find a second instance further in the document
+                second_index = text_lower.find(keyword_lower, index + 100)
+                if second_index > -1 and second_index != index:
+                    start2 = max(0, second_index - 2000)
+                    end2 = min(len(combined_text), second_index + 2000)
+                    relevant_sections.append(combined_text[start2:end2])
+    
+    # If no relevant sections with keywords were found, use the beginning of the document
+    if not relevant_sections:
+        relevant_sections = [combined_text[:8000]]
+    
+    # Process and combine sections (same as in evaluate_indicator)
+    unique_sections = []
+    for section in relevant_sections[:4]:
+        if section not in unique_sections:
+            unique_sections.append(section)
+    
+    combined_text = "\n\n[...]\n\n".join(unique_sections)
+    
+    if len(combined_text) > 8000:
+        combined_text = combined_text[:8000]
+    
+    # Use the existing evaluation logic from here (almost identical to evaluate_indicator)
+    model = genai.GenerativeModel('gemini-1.5-flash-8b')
+    
+    # Create evaluation prompt
+    prompt = f"""
+    You are an ESG (Environmental, Social, Governance) scoring expert. 
+    Analyze the following extracted text against the indicator: {indicator_code} - {indicator['disclosure']}.
+    
+    Indicator description: {indicator['description']}
+    
+    Relevant keywords to look for: {', '.join(indicator['keywords'])}
+    
+    Scoring criteria:
+    0: {indicator['criteria']['0']}
+    1: {indicator['criteria'].get('1', 'Not specified')}
+    2: {indicator['criteria'].get('2', 'Not specified')}
+    3: {indicator['criteria'].get('3', 'Not specified')}
+    4: {indicator['criteria']['4']}
+    
+    Based on the text below, assign a score from 0-4 and provide a brief explanation (2-3 sentences) justifying your score.
+    
+    First give your score as a single digit (0-4), then on a new line provide your explanation.
+    
+    Example:
+    3
+    The text clearly describes procedures for waste management including recycling programs. It provides quantitative data on waste reduction but lacks complete information on circular economy implementation.
+    
+    {combined_text}
+    """
+    
+    # Get token count and make API request
+    prompt_token_count = model.count_tokens(prompt).total_tokens
+    
+    try:
+        response = await model.generate_content_async(prompt)
+        
+        # Parse response to extract score and reasoning
+        response_text = response.text.strip()
+        lines = response_text.split("\n", 1)
+        
+        # Extract score from first line
+        score = 0
+        for char in lines[0].strip():
+            if char.isdigit() and int(char) in [0, 1, 2, 3, 4]:
+                score = int(char)
+                break
+        
+        # Extract reasoning from remaining text
+        reasoning = lines[1].strip() if len(lines) > 1 else "No explanation provided."
+        
+        # Get token usage
+        token_count = {
+            "total_tokens": prompt_token_count + (len(response_text) // 4),
+            "prompt_tokens": prompt_token_count,
+            "response_tokens": len(response_text) // 4
+        }
+        
+        return score, reasoning, token_count
+        
+    except Exception as e:
+        return 0, f"Error: {str(e)}", {"total_tokens": prompt_token_count, "prompt_tokens": prompt_token_count, "response_tokens": 0}
+
 def calculate_summary_scores(results):
     """Calculate summary scores by category"""
     categories = {
@@ -393,6 +699,8 @@ def calculate_summary_scores(results):
     total_scores = sum(data["total"] for data in categories.values())
     total_indicators = sum(data["count"] for data in categories.values())
     summary["overall"] = round(total_scores / total_indicators, 2) if total_indicators > 0 else 0
+
+    summary["spdi_index"] = total_scores
     
     return summary
 
