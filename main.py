@@ -12,6 +12,13 @@ import base64
 import tempfile
 import time
 from fastapi.middleware.cors import CORSMiddleware
+from neon import init_db, save_analysis_results, get_document_analysis, get_all_documents
+from datetime import datetime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.dialects.postgresql import JSONB
+from dotenv import load_dotenv
+
 
 app = FastAPI()
 # Add CORS middleware
@@ -22,6 +29,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_db_client():
+    init_db()
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -150,9 +161,13 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
     try:
         pdf_content = await pdf.read()
 
-        # Use the enhanced extraction function
-        extracted_text = await extract_pdf_text(pdf_content)
+        # Upload to S3 first (import the S3 functions)
+        from aws import upload_to_s3
+        s3_object_key = await upload_to_s3(pdf_content, pdf.filename)
         
+        if not s3_object_key:
+            raise HTTPException(status_code=500, detail="Failed to upload document to S3")
+
         # Track extraction time
         extraction_start = time.time()
         extracted_text = await extract_pdf_text(pdf_content)
@@ -169,6 +184,9 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
             extraction_warning = f"Warning: PDF extraction issues detected: {', '.join(extraction_quality['extraction_issues'])}"
         else:
             extraction_warning = None
+
+        # Get file size
+        file_size = len(pdf_content)
         
         # Track token usage across all evaluations
         total_tokens_used = 0
@@ -238,17 +256,34 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
             "indicator_processing_times": ai_processing_times
         }
 
+        # Prepare token usage data
+        token_usage_data = {
+            "total_tokens_used": total_tokens_used,
+            "by_indicator": token_usage_by_indicator
+        }
+        
+        # Save results to Neon database
+        document_id = await save_analysis_results(
+            filename=pdf.filename,
+            s3_object_key=s3_object_key,
+            file_size=file_size,
+            extraction_quality=extraction_quality,
+            results=results,
+            summary=summary,
+            token_usage=token_usage_data,
+            performance_metrics=timing_metrics
+        )
+
         return {
+            "id": document_id,
             "filename": pdf.filename,
+            "s3_object_key": s3_object_key,
             "extraction_quality": extraction_quality,
             "extraction_warning": extraction_warning,
             "indicators": results,
             "summary": summary,
-            "token_usage": {
-                "total_tokens_used": total_tokens_used,
-                "by_indicator": token_usage_by_indicator
-            },
-            "performance_metrics": timing_metrics  # Add timing metrics to response
+            "token_usage": token_usage_data,
+            "performance_metrics": timing_metrics
         }
     except Exception as e:
         # Calculate time even for errors
@@ -774,6 +809,49 @@ async def extract_pdf_text(pdf_content):
     
     # Return the best text we have (either PyPDF2 or Gemini)
     return extracted_text
+
+# Related to Database endpoints
+@app.get("/documents")
+async def list_documents(limit: int = 100, offset: int = 0):
+    """Get a list of all analyzed documents"""
+    try:
+        documents = await get_all_documents(limit, offset)
+        return {"documents": documents, "count": len(documents)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving documents: {str(e)}")
+
+@app.get("/documents/{document_id}")
+async def get_document(document_id: int):
+    """Get the complete analysis results for a document"""
+    try:
+        document = await get_document_analysis(document_id)
+        if not document:
+            raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
+        return document
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving document: {str(e)}")
+
+@app.get("/documents/{document_id}/pdf")
+async def get_document_pdf(document_id: int):
+    """Get a presigned URL to access the original PDF"""
+    try:
+        from aws import generate_presigned_url
+        document = await get_document_analysis(document_id)
+        
+        if not document:
+            raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
+        
+        url = await generate_presigned_url(document["s3_object_key"])
+        
+        if not url:
+            raise HTTPException(status_code=500, detail="Failed to generate URL")
+            
+        return {"url": url, "expires_in": "1 hour"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating URL: {str(e)}")
+
 
 # Utility endpoints
 @app.get("/scoring-rules")
