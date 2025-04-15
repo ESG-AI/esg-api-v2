@@ -22,6 +22,16 @@ async def upload_to_s3(file_content, filename=None):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         filename = f"document_{timestamp}_{unique_id}.pdf"
+    else:
+        # Generate a unique name based on the original filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+
+        # Split the original filename to keep the extension
+        base_name, extension = os.path.splitext(filename)
+
+        # Create a new unique filename that preserves the original name and extension
+        filename = f"{base_name}_{timestamp}_{unique_id}{extension}"
     
     object_key = f"uploads/{filename}"
     

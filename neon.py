@@ -1,6 +1,5 @@
 import os
 from datetime import datetime
-import json
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
@@ -62,6 +61,7 @@ class ScoreSummary(Base):
     social_score = Column(Float)
     environmental_score = Column(Float)
     overall_score = Column(Float)
+    spdi_index_score = Column(Float)
     
     # Relationships
     document = relationship("Document", back_populates="score_summary")
@@ -124,7 +124,8 @@ def save_analysis_results(filename, s3_object_key, file_size, extraction_quality
             economic_score=summary.get("economic", 0.0),
             social_score=summary.get("social", 0.0),
             environmental_score=summary.get("environmental", 0.0),
-            overall_score=summary.get("overall", 0.0)
+            overall_score=summary.get("overall", 0.0),
+            spdi_index_score=summary.get("spdi_index", 0.0)
         )
         db.add(score_summary)
         
@@ -192,39 +193,42 @@ async def get_document_analysis(document_id):
         db.close()
 
 def get_all_documents(limit=100, offset=0):
-    """
-    Retrieve a paginated list of all analyzed documents with summary scores
-    
-    Args:
-        limit: Maximum number of documents to return
-        offset: Offset for pagination
-        
-    Returns:
-        list: List of documents with summary scores
-    """
-    db = SessionLocal()
+    """Get a list of all analyzed documents with individual indicator scores and SPDI index"""
     try:
-        documents = db.query(Document).order_by(Document.upload_date.desc()).limit(limit).offset(offset).all()
-        
-        results = []
-        for doc in documents:
-            summary = None
-            if doc.score_summary:
-                summary = {
-                    "governance": doc.score_summary.governance_score,
-                    "economic": doc.score_summary.economic_score,
-                    "social": doc.score_summary.social_score,
-                    "environmental": doc.score_summary.environmental_score,
-                    "overall": doc.score_summary.overall_score
-                }
+        # Use SessionLocal instead of Session from requests
+        with SessionLocal() as session:
+            documents = session.query(Document).order_by(Document.id.desc()).offset(offset).limit(limit).all()
             
-            results.append({
-                "id": doc.id,
-                "filename": doc.filename,
-                "upload_date": doc.upload_date.isoformat(),
-                "summary": summary
-            })
-        
-        return results
-    finally:
-        db.close()
+            result = []
+            for doc in documents:
+                # Get all indicator scores for this document
+                indicators = {}
+                for indicator in doc.analysis_results:
+                    indicators[indicator.indicator_code] = {
+                        "score": indicator.score,
+                        "title": indicator.indicator_title,
+                        "type": indicator.indicator_type,
+                        "subtype": indicator.indicator_subtype,
+                        "description": indicator.indicator_description,
+                        "reasoning": indicator.reasoning
+                    }
+                
+                # Get SPDI index score from score_summary
+                spdi_index = doc.score_summary.spdi_index_score if doc.score_summary else 0
+                
+                # Create a document entry with detailed indicator scores and SPDI index
+                doc_entry = {
+                    "id": doc.id,
+                    "filename": doc.filename,
+                    "created_at": doc.upload_date.isoformat(),
+                    "file_size": doc.file_size,
+                    "spdi_index": spdi_index,
+                    # All individual indicator scores
+                    "indicators": indicators
+                }
+                result.append(doc_entry)
+                
+            return result
+    except Exception as e:
+        print(f"Error getting documents: {e}")
+        return []
