@@ -17,7 +17,7 @@ from datetime import datetime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import JSONB
-from dotenv import load_dotenv
+from aws import upload_to_s3
 
 
 app = FastAPI()
@@ -263,7 +263,7 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
         }
         
         # Save results to Neon database
-        document_id = await save_analysis_results(
+        document_id = save_analysis_results(
             filename=pdf.filename,
             s3_object_key=s3_object_key,
             file_size=file_size,
@@ -413,6 +413,7 @@ async def evaluate_multi_documents(
     start_time = time.time()
     
     documents = []
+    file_details = []
     
     # Track extraction time
     extraction_start = time.time()
@@ -420,14 +421,33 @@ async def evaluate_multi_documents(
     for i, file in enumerate(files):
         content = await file.read()
         
+        # Upload to S3 (similar to evaluate endpoint)
+        s3_object_key = await upload_to_s3(content, file.filename)
+        
+        if not s3_object_key:
+            raise HTTPException(status_code=500, detail=f"Failed to upload document {file.filename} to S3")
+        
         # Extract text from the document
         extracted_text = await extract_pdf_text(content)
+        
+        # Get extraction quality
+        pdf_file = io.BytesIO(content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
         
         # Auto-classify document if type not provided
         doc_type = document_types[i] if document_types and i < len(document_types) else None
         if not doc_type:
             doc_type = classify_document_type(extracted_text)
             
+        # Store file details for database
+        file_details.append({
+            "filename": file.filename,
+            "s3_object_key": s3_object_key,
+            "file_size": len(content),
+            "extraction_quality": extraction_quality
+        })
+        
         documents.append({
             "filename": file.filename,
             "text": extracted_text,
@@ -489,15 +509,34 @@ async def evaluate_multi_documents(
         "ai_evaluation_time_seconds": round(sum(ai_processing_times.values()), 2),
         "indicator_processing_times": ai_processing_times
     }
+
+    # Prepare token usage data
+    token_usage_data = {
+        "total_tokens_used": total_tokens_used,
+        "by_indicator": token_usage_by_indicator
+    }
+
+    #Save main document to database (using first file as primary document)
+    if file_details:
+        document_id = save_analysis_results(
+            filename=file_details[0]["filename"],
+            s3_object_key=file_details[0]["s3_object_key"],
+            file_size=file_details[0]["file_size"],
+            extraction_quality=file_details[0]["extraction_quality"],
+            results=results,
+            summary=summary,
+            token_usage=token_usage_data,
+            performance_metrics=timing_metrics
+        )
+    else:
+        document_id = None
     
     return {
+        "id": document_id,
         "documents": [{"filename": doc["filename"], "type": doc["type"]} for doc in documents],
         "indicators": results,
         "summary": summary,
-        "token_usage": {
-            "total_tokens_used": total_tokens_used,
-            "by_indicator": token_usage_by_indicator
-        },
+        "token_usage": token_usage_data,
         "performance_metrics": timing_metrics
     }
 
@@ -815,7 +854,7 @@ async def extract_pdf_text(pdf_content):
 async def list_documents(limit: int = 100, offset: int = 0):
     """Get a list of all analyzed documents"""
     try:
-        documents = await get_all_documents(limit, offset)
+        documents = get_all_documents(limit, offset)
         return {"documents": documents, "count": len(documents)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving documents: {str(e)}")
@@ -824,7 +863,7 @@ async def list_documents(limit: int = 100, offset: int = 0):
 async def get_document(document_id: int):
     """Get the complete analysis results for a document"""
     try:
-        document = await get_document_analysis(document_id)
+        document = get_document_analysis(document_id)
         if not document:
             raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
         return document
@@ -838,12 +877,12 @@ async def get_document_pdf(document_id: int):
     """Get a presigned URL to access the original PDF"""
     try:
         from aws import generate_presigned_url
-        document = await get_document_analysis(document_id)
+        document = get_document_analysis(document_id)
         
         if not document:
             raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
         
-        url = await generate_presigned_url(document["s3_object_key"])
+        url = generate_presigned_url(document["s3_object_key"])
         
         if not url:
             raise HTTPException(status_code=500, detail="Failed to generate URL")
