@@ -884,7 +884,7 @@ async def get_document_pdf(document_id: int):
         if not document:
             raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
         
-        url = generate_presigned_url(document["s3_object_key"])
+        url = await generate_presigned_url(document["s3_object_key"])
         
         if not url:
             raise HTTPException(status_code=500, detail="Failed to generate URL")
