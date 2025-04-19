@@ -149,12 +149,24 @@ def check_extraction_quality(extracted_text, pdf_reader):
     return diagnostics
 
 @app.post("/evaluate")
-async def evaluate_pdf(pdf: UploadFile = File(...)):
+async def evaluate_pdf(
+    pdf: UploadFile = File(...),
+    document_type: str = "sustainability_report"
+    ):
     """
-    Evaluate a single PDF sustainability report against all ESG indices.
-    Makes individual Gemini API requests for each index to ensure focused evaluation.
-    Includes token usage information for API monitoring.
+    Evaluate a single PDF against all ESG indices with specified document type.
+    
+    Args:
+        pdf: The PDF file to analyze
+        document_type: Document type (sustainability_report, annual_report, or financial_statement)
+        
+    Returns:
+        Complete analysis results with scores for all indices
     """
+    # Validate document type
+    if document_type not in ["sustainability_report", "annual_report", "financial_statement"]:
+        document_type = "sustainability_report"  # Default if invalid type provided
+      
     # Track overall processing time
     start_time = time.time()
 
@@ -277,6 +289,7 @@ async def evaluate_pdf(pdf: UploadFile = File(...)):
         return {
             "id": document_id,
             "filename": pdf.filename,
+            "document_type": document_type,
             "s3_object_key": s3_object_key,
             "extraction_quality": extraction_quality,
             "extraction_warning": extraction_warning,
@@ -406,9 +419,14 @@ async def evaluate_indicator(text, indicator_code, indicator):
 @app.post("/evaluate-multi")
 async def evaluate_multi_documents(
     files: List[UploadFile] = File(...),
-    document_types: Optional[List[str]] = None
+    document_types: List[str] = None
 ):
-    """Process multiple documents with optional type classification"""
+    """
+    Process multiple documents with client-specified document types.
+    
+    Each document type should be one of: 'sustainability_report', 'annual_report', 'financial_statement'
+    If document_types is not provided, all documents will be treated as 'sustainability_report'
+    """
     # Track overall processing time
     start_time = time.time()
     
@@ -435,17 +453,20 @@ async def evaluate_multi_documents(
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
         
-        # Auto-classify document if type not provided
-        doc_type = document_types[i] if document_types and i < len(document_types) else None
-        if not doc_type:
-            doc_type = classify_document_type(extracted_text)
+        # Use client-provided document type or default to sustainability_report
+        doc_type = "sustainability_report"  # Default type
+        if document_types and i < len(document_types) and document_types[i]:
+            # Validate the document type
+            if document_types[i] in ["sustainability_report", "annual_report", "financial_statement"]:
+                doc_type = document_types[i]
             
         # Store file details for database
         file_details.append({
             "filename": file.filename,
             "s3_object_key": s3_object_key,
             "file_size": len(content),
-            "extraction_quality": extraction_quality
+            "extraction_quality": extraction_quality,
+            "document_type": doc_type
         })
         
         documents.append({
@@ -540,37 +561,37 @@ async def evaluate_multi_documents(
         "performance_metrics": timing_metrics
     }
 
-def classify_document_type(text):
-    """Classify document type based on content analysis"""
-    # Simple rule-based classification
-    text_lower = text.lower()
+# def classify_document_type(text):
+#     """Classify document type based on content analysis"""
+#     # Simple rule-based classification
+#     text_lower = text.lower()
     
-    # Check for sustainability report indicators
-    sustainability_terms = ["sustainability report", "esg report", "environmental, social", 
-                          "carbon footprint", "greenhouse gas emissions", "gri standards"]
-    sustainability_score = sum(1 for term in sustainability_terms if term in text_lower)
+#     # Check for sustainability report indicators
+#     sustainability_terms = ["sustainability report", "esg report", "environmental, social", 
+#                           "carbon footprint", "greenhouse gas emissions", "gri standards"]
+#     sustainability_score = sum(1 for term in sustainability_terms if term in text_lower)
     
-    # Check for annual report indicators
-    annual_report_terms = ["annual report", "financial year", "dear shareholders", 
-                         "board of directors", "financial statements", "corporate governance"]
-    annual_report_score = sum(1 for term in annual_report_terms if term in text_lower)
+#     # Check for annual report indicators
+#     annual_report_terms = ["annual report", "financial year", "dear shareholders", 
+#                          "board of directors", "financial statements", "corporate governance"]
+#     annual_report_score = sum(1 for term in annual_report_terms if term in text_lower)
     
-    # Check for financial statement indicators
-    financial_terms = ["balance sheet", "income statement", "cash flow statement", 
-                     "statement of financial position", "notes to financial statements"]
-    financial_score = sum(1 for term in financial_terms if term in text_lower)
+#     # Check for financial statement indicators
+#     financial_terms = ["balance sheet", "income statement", "cash flow statement", 
+#                      "statement of financial position", "notes to financial statements"]
+#     financial_score = sum(1 for term in financial_terms if term in text_lower)
     
-    # Determine document type based on highest score
-    max_score = max(sustainability_score, annual_report_score, financial_score)
+#     # Determine document type based on highest score
+#     max_score = max(sustainability_score, annual_report_score, financial_score)
     
-    if max_score == 0:
-        return "unknown"
-    elif max_score == sustainability_score:
-        return "sustainability_report"
-    elif max_score == annual_report_score:
-        return "annual_report"
-    else:
-        return "financial_statement"
+#     if max_score == 0:
+#         return "unknown"
+#     elif max_score == sustainability_score:
+#         return "sustainability_report"
+#     elif max_score == annual_report_score:
+#         return "annual_report"
+#     else:
+#         return "financial_statement"
 
 def build_indicator_context(documents, indicator):
     """
@@ -749,32 +770,13 @@ async def evaluate_indicator_with_context(context, indicator_code, indicator):
 
 def calculate_summary_scores(results):
     """Calculate summary scores by category"""
-    categories = {
-        "governance": {"total": 0, "count": 0},
-        "economic": {"total": 0, "count": 0},
-        "social": {"total": 0, "count": 0},
-        "environmental": {"total": 0, "count": 0}
+    # Calculate total score (SPDI index)
+    total_score = sum(result["score"] for result in results.values())
+    
+    # Create a minimal summary with just the SPDI index
+    summary = {
+        "spdi_index": total_score
     }
-    
-    for indicator_code, result in results.items():
-        category = result["type"]
-        if category in categories:
-            categories[category]["total"] += result["score"]
-            categories[category]["count"] += 1
-    
-    summary = {}
-    for category, data in categories.items():
-        if data["count"] > 0:
-            summary[category] = round(data["total"] / data["count"], 2)
-        else:
-            summary[category] = 0
-    
-    # Calculate overall score
-    total_scores = sum(data["total"] for data in categories.values())
-    total_indicators = sum(data["count"] for data in categories.values())
-    summary["overall"] = round(total_scores / total_indicators, 2) if total_indicators > 0 else 0
-
-    summary["spdi_index"] = total_scores
     
     return summary
 
