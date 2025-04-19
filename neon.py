@@ -56,11 +56,6 @@ class ScoreSummary(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     document_id = Column(Integer, ForeignKey("documents.id"), unique=True)
-    governance_score = Column(Float)
-    economic_score = Column(Float)
-    social_score = Column(Float)
-    environmental_score = Column(Float)
-    overall_score = Column(Float)
     spdi_index_score = Column(Float)
     
     # Relationships
@@ -120,11 +115,6 @@ def save_analysis_results(filename, s3_object_key, file_size, extraction_quality
         # Create score summary
         score_summary = ScoreSummary(
             document_id=document.id,
-            governance_score=summary.get("governance", 0.0),
-            economic_score=summary.get("economic", 0.0),
-            social_score=summary.get("social", 0.0),
-            environmental_score=summary.get("environmental", 0.0),
-            overall_score=summary.get("overall", 0.0),
             spdi_index_score=summary.get("spdi_index", 0.0)
         )
         db.add(score_summary)
@@ -170,11 +160,7 @@ async def get_document_analysis(document_id):
         
         # Format summary
         summary = {
-            "governance": document.score_summary.governance_score,
-            "economic": document.score_summary.economic_score,
-            "social": document.score_summary.social_score,
-            "environmental": document.score_summary.environmental_score,
-            "overall": document.score_summary.overall_score
+            "spdi_index": document.score_summary.spdi_index_score if document.score_summary else 0
         }
         
         # Compile complete response
@@ -195,7 +181,6 @@ async def get_document_analysis(document_id):
 def get_all_documents(limit=100, offset=0):
     """Get a list of all analyzed documents with individual indicator scores and SPDI index"""
     try:
-        # Use SessionLocal instead of Session from requests
         with SessionLocal() as session:
             documents = session.query(Document).order_by(Document.id.desc()).offset(offset).limit(limit).all()
             
