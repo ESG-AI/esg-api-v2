@@ -127,7 +127,7 @@ def save_analysis_results(filename, s3_object_key, file_size, extraction_quality
     finally:
         db.close()
 
-async def get_document_analysis(document_id):
+def get_document_analysis(document_id):
     """
     Retrieve document analysis results by document ID
     
@@ -153,7 +153,7 @@ async def get_document_analysis(document_id):
                 "reasoning": result.reasoning,
                 "title": result.indicator_title,
                 "type": result.indicator_type,
-                "sub_type": result.indicator_subtype,
+                "subtype": result.indicator_subtype,
                 "description": result.indicator_description,
                 "token_usage": result.token_usage
             }
@@ -169,6 +169,7 @@ async def get_document_analysis(document_id):
             "filename": document.filename,
             "upload_date": document.upload_date.isoformat(),
             "s3_object_key": document.s3_object_key,
+            "file_size": document.file_size,
             "extraction_quality": document.extraction_quality,
             "indicators": results,
             "summary": summary,
