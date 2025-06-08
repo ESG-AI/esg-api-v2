@@ -311,7 +311,7 @@ async def evaluate_indicator(text, indicator_code, indicator):
     """
     
     # Configure Gemini model for this specific evaluation
-    model = genai.GenerativeModel('gemini-1.5-flash-8b')
+    model = genai.GenerativeModel('gemini-1.5-pro')
     
     # Find the most relevant sections of text based on keywords
     keywords = indicator['keywords']
@@ -371,15 +371,24 @@ async def evaluate_indicator(text, indicator_code, indicator):
     2: {indicator['criteria'].get('2', 'Not specified')}
     3: {indicator['criteria'].get('3', 'Not specified')}
     4: {indicator['criteria']['4']}
+    """
+
+     # Add reference examples if available
+    if "references" in indicator:
+        prompt += "\n\nREFERENCE EXAMPLES FOR EACH SCORE LEVEL:\n"
+        
+        for score in sorted([s for s in indicator["references"].keys() if s.isdigit()]):
+            if indicator["references"].get(score):
+                prompt += f"\n--- EXAMPLE FOR SCORE {score} ---\n"
+                prompt += f"{indicator['references'][score]}\n"
     
-    Based on the text below, assign a score from 0-4 and provide a brief explanation (2-3 sentences) justifying your score.
+     # Add instructions and text to analyze
+    prompt += f"""
+    Based on the examples and scoring criteria above, assign a score from 0-4 to the following text.
     
     First give your score as a single digit (0-4), then on a new line provide your explanation.
     
-    Example:
-    3
-    The text clearly describes procedures for waste management including recycling programs. It provides quantitative data on waste reduction but lacks complete information on circular economy implementation.
-    
+    TEXT TO ANALYZE:
     {combined_text}
     """
 
@@ -707,7 +716,7 @@ async def evaluate_indicator_with_context(context, indicator_code, indicator):
         combined_text = combined_text[:8000]
     
     # Use the existing evaluation logic from here (almost identical to evaluate_indicator)
-    model = genai.GenerativeModel('gemini-1.5-flash-8b')
+    model = genai.GenerativeModel('gemini-1.5-pro')
     
     # Create evaluation prompt
     prompt = f"""
