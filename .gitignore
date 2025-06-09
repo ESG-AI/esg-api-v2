@@ -2,3 +2,5 @@ venv/
 __pycache__/
 *.pyc
 .env
+gemini_prompts.log
+.DS_Store
