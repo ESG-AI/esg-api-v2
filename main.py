@@ -18,6 +18,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import JSONB
 from aws import upload_to_s3
+import logging
 
 
 app = FastAPI()
@@ -41,6 +42,18 @@ print(f"Gemini SDK version: {genai.__version__}")
 # Load scoring rules from JSON file
 with open("scoring_rules.json", "r") as f:
     scoring_rules = json.load(f)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('gemini_prompts.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger('gemini_prompts')
 
 @app.post("/extract")
 async def extract_pdf(pdf: UploadFile = File(...)):
@@ -392,6 +405,9 @@ async def evaluate_indicator(text, indicator_code, indicator):
     {combined_text}
     """
 
+    # Log the prompt
+    logger.info(f"Gemini Prompt for {indicator_code}:\n{prompt}")
+
     # Get token count for the prompt before sending
     prompt_token_count = model.count_tokens(prompt).total_tokens
     
@@ -420,9 +436,13 @@ async def evaluate_indicator(text, indicator_code, indicator):
             "response_tokens": len(response_text) // 4
         }
         
+        # Log the response
+        logger.info(f"Gemini Response for {indicator_code}:\nScore: {score}\nReasoning: {reasoning}\nToken Usage: {token_count}")
+        
         return score, reasoning, token_count
         
     except Exception as e:
+        logger.error(f"Error in Gemini evaluation for {indicator_code}: {str(e)}")
         return 0, f"Error: {str(e)}", {"total_tokens": prompt_token_count, "prompt_tokens": prompt_token_count, "response_tokens": 0}
 
 @app.post("/evaluate-multi")
