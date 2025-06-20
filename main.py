@@ -25,7 +25,7 @@ app = FastAPI()
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development only - restrict in production
+    allow_origins=["https://esg-dashboard-91c52f1e40e9.herokuapp.com"],  # Allow only the deployed frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
