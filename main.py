@@ -186,24 +186,26 @@ async def evaluate_pdf(
     try:
         pdf_content = await pdf.read()
 
-        # Upload to S3 first (import the S3 functions)
+        # S3 upload timing
+        s3_upload_start = time.time()
         from aws import upload_to_s3
         s3_object_key = await upload_to_s3(pdf_content, pdf.filename)
+        s3_upload_time = time.time() - s3_upload_start
         
         if not s3_object_key:
             raise HTTPException(status_code=500, detail="Failed to upload document to S3")
 
-        # Track extraction time
+        # Extraction timing
         extraction_start = time.time()
         extracted_text = await extract_pdf_text(pdf_content)
         extraction_time = time.time() - extraction_start
         
-        # Extract text from PDF using PyPDF2 instead of Gemini API
+        # Extraction quality check timing
+        quality_check_start = time.time()
         pdf_file = io.BytesIO(pdf_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
-
-        # Check extraction quality
         extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
+        quality_check_time = time.time() - quality_check_start
         
         if not extraction_quality["extraction_success"]:
             extraction_warning = f"Warning: PDF extraction issues detected: {', '.join(extraction_quality['extraction_issues'])}"
@@ -219,6 +221,7 @@ async def evaluate_pdf(
 
         # Track AI processing times for each indicator
         ai_processing_times = {}
+        ai_evaluation_start = time.time()
         
         # Evaluate against all indicators with individual API calls for each index
         results = {}
@@ -266,28 +269,13 @@ async def evaluate_pdf(
                     "description": indicator.get("description", ""),
                     "error": error_message
                 }
+        ai_evaluation_time = time.time() - ai_evaluation_start
         
         # Calculate summary scores by category
         summary = calculate_summary_scores(results)
 
-         # Calculate total processing time
-        total_time = time.time() - start_time
-        
-        # Add timing metrics to response
-        timing_metrics = {
-            "total_processing_time_seconds": round(total_time, 2),
-            "extraction_time_seconds": round(extraction_time, 2),
-            "ai_evaluation_time_seconds": round(sum(ai_processing_times.values()), 2),
-            "indicator_processing_times": ai_processing_times
-        }
-
-        # Prepare token usage data
-        token_usage_data = {
-            "total_tokens_used": total_tokens_used,
-            "by_indicator": token_usage_by_indicator
-        }
-        
-        # Save results to Neon database
+        # Database save timing
+        db_save_start = time.time()
         document_id = save_analysis_results(
             filename=pdf.filename,
             s3_object_key=s3_object_key,
@@ -295,9 +283,30 @@ async def evaluate_pdf(
             extraction_quality=extraction_quality,
             results=results,
             summary=summary,
-            token_usage=token_usage_data,
-            performance_metrics=timing_metrics
+            token_usage=token_usage_by_indicator,
+            performance_metrics=None  # Will update below
         )
+        db_save_time = time.time() - db_save_start
+
+        # Calculate total processing time
+        total_time = time.time() - start_time
+        
+        # Add timing metrics to response
+        timing_metrics = {
+            "total_processing_time_seconds": round(total_time, 2),
+            "s3_upload_time_seconds": round(s3_upload_time, 2),
+            "extraction_time_seconds": round(extraction_time, 2),
+            "extraction_quality_check_time_seconds": round(quality_check_time, 2),
+            "ai_evaluation_time_seconds": round(ai_evaluation_time, 2),
+            "indicator_processing_times": ai_processing_times,
+            "db_save_time_seconds": round(db_save_time, 2)
+        }
+
+        # Prepare token usage data
+        token_usage_data = {
+            "total_tokens_used": total_tokens_used,
+            "by_indicator": token_usage_by_indicator
+        }
 
         return {
             "id": document_id,
@@ -404,9 +413,6 @@ async def evaluate_indicator(text, indicator_code, indicator):
     TEXT TO ANALYZE:
     {combined_text}
     """
-
-    # Log the prompt
-    logger.info(f"Gemini Prompt for {indicator_code}:\n{prompt}")
 
     # Get token count for the prompt before sending
     prompt_token_count = model.count_tokens(prompt).total_tokens
