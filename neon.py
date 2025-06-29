@@ -13,7 +13,7 @@ load_dotenv()
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL")
 
 # Create SQLAlchemy engine
-engine = create_engine(NEON_DATABASE_URL)
+engine = create_engine(NEON_DATABASE_URL, pool_pre_ping=True)
 Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -68,57 +68,120 @@ def init_db():
 # Database operations
 def save_analysis_results(filename, s3_object_key, file_size, extraction_quality, results, summary, token_usage, performance_metrics):
     """
-    Save analysis results to the database
-    
-    Args:
-        filename: Original filename of the document
-        s3_object_key: S3 object key where the document is stored
-        file_size: Size of the file in bytes
-        extraction_quality: Dictionary with extraction quality metrics
-        results: Dictionary of indicator results
-        summary: Dictionary of summary scores by category
-        token_usage: Dictionary of token usage information
-        performance_metrics: Dictionary of performance metrics
-        
-    Returns:
-        int: The ID of the created document record
+    Save or update analysis results in the database for a given S3 object key.
+    If a Document with the same s3_object_key exists, update it with new indicator results.
+    Otherwise, create a new Document.
     """
     db = SessionLocal()
     try:
-        # Create document record
-        document = Document(
-            filename=filename,
-            s3_object_key=s3_object_key,
-            file_size=file_size,
-            extraction_quality=extraction_quality,
-            token_usage=token_usage,
-            performance_metrics=performance_metrics
-        )
-        db.add(document)
-        db.flush()
-        
-        # Create analysis results
-        for indicator_code, result in results.items():
-            analysis_result = AnalysisResult(
-                document_id=document.id,
-                indicator_code=indicator_code,
-                indicator_title=result.get("title", ""),
-                indicator_type=result.get("type", ""),
-                indicator_subtype=result.get("sub_type", ""),
-                indicator_description=result.get("description", ""),
-                score=result.get("score", 0),
-                reasoning=result.get("reasoning", ""),
-                token_usage=result.get("token_usage", {})
+        # Try to find an existing document with the same S3 key
+        document = db.query(Document).filter(Document.s3_object_key == s3_object_key).first()
+        if document:
+            # Update document metadata (optional: update filename, file_size, extraction_quality, etc.)
+            document.filename = filename
+            document.file_size = file_size
+            document.extraction_quality = extraction_quality
+            document.token_usage = token_usage
+            # Sum total_processing_time_seconds if present
+            old_metrics = document.performance_metrics or {}
+            new_metrics = performance_metrics or {}
+            old_time = old_metrics.get("total_processing_time_seconds", 0)
+            new_time = new_metrics.get("total_processing_time_seconds", 0)
+            summed_time = old_time + new_time
+
+            # Sum ai_evaluation_time_seconds
+            old_ai_time = old_metrics.get("ai_evaluation_time_seconds", 0)
+            new_ai_time = new_metrics.get("ai_evaluation_time_seconds", 0)
+            summed_ai_time = old_ai_time + new_ai_time
+
+            # Merge indicator_processing_times
+            old_indicator_times = old_metrics.get("indicator_processing_times", {})
+            new_indicator_times = new_metrics.get("indicator_processing_times", {})
+            merged_indicator_times = dict(old_indicator_times)
+            merged_indicator_times.update(new_indicator_times)
+
+            # Overwrite all metrics but update total_processing_time_seconds, ai_evaluation_time_seconds, and indicator_processing_times
+            merged_metrics = dict(new_metrics)
+            merged_metrics["total_processing_time_seconds"] = summed_time
+            merged_metrics["ai_evaluation_time_seconds"] = summed_ai_time
+            merged_metrics["indicator_processing_times"] = merged_indicator_times
+            document.performance_metrics = merged_metrics
+            db.flush()
+
+            # Update or add analysis results for each indicator
+            existing_codes = {ar.indicator_code: ar for ar in document.analysis_results}
+            for indicator_code, result in results.items():
+                if indicator_code in existing_codes:
+                    # Update existing result
+                    ar = existing_codes[indicator_code]
+                    ar.indicator_title = result.get("title", "")
+                    ar.indicator_type = result.get("type", "")
+                    ar.indicator_subtype = result.get("sub_type", "")
+                    ar.indicator_description = result.get("description", "")
+                    ar.score = result.get("score", 0)
+                    ar.reasoning = result.get("reasoning", "")
+                    ar.token_usage = result.get("token_usage", {})
+                else:
+                    # Add new result
+                    analysis_result = AnalysisResult(
+                        document_id=document.id,
+                        indicator_code=indicator_code,
+                        indicator_title=result.get("title", ""),
+                        indicator_type=result.get("type", ""),
+                        indicator_subtype=result.get("sub_type", ""),
+                        indicator_description=result.get("description", ""),
+                        score=result.get("score", 0),
+                        reasoning=result.get("reasoning", ""),
+                        token_usage=result.get("token_usage", {})
+                    )
+                    db.add(analysis_result)
+            db.commit()  # Commit to ensure all changes are persisted
+
+            # Recalculate total SPDI index score as the sum of all indicator scores for this document
+            total_spdi_index = sum(ar.score for ar in db.query(AnalysisResult).filter(AnalysisResult.document_id == document.id))
+
+            # Update or create score summary
+            if document.score_summary:
+                document.score_summary.spdi_index_score = total_spdi_index
+            else:
+                score_summary = ScoreSummary(
+                    document_id=document.id,
+                    spdi_index_score=total_spdi_index
+                )
+                db.add(score_summary)
+            db.commit()  # Commit the updated score summary
+        else:
+            # Create document record
+            document = Document(
+                filename=filename,
+                s3_object_key=s3_object_key,
+                file_size=file_size,
+                extraction_quality=extraction_quality,
+                token_usage=token_usage,
+                performance_metrics=performance_metrics
             )
-            db.add(analysis_result)
-        
-        # Create score summary
-        score_summary = ScoreSummary(
-            document_id=document.id,
-            spdi_index_score=summary.get("spdi_index", 0.0)
-        )
-        db.add(score_summary)
-        
+            db.add(document)
+            db.flush()
+            # Create analysis results
+            for indicator_code, result in results.items():
+                analysis_result = AnalysisResult(
+                    document_id=document.id,
+                    indicator_code=indicator_code,
+                    indicator_title=result.get("title", ""),
+                    indicator_type=result.get("type", ""),
+                    indicator_subtype=result.get("sub_type", ""),
+                    indicator_description=result.get("description", ""),
+                    score=result.get("score", 0),
+                    reasoning=result.get("reasoning", ""),
+                    token_usage=result.get("token_usage", {})
+                )
+                db.add(analysis_result)
+            # Create score summary
+            score_summary = ScoreSummary(
+                document_id=document.id,
+                spdi_index_score=summary.get("spdi_index", 0.0)
+            )
+            db.add(score_summary)
         db.commit()
         return document.id
     except Exception as e:
