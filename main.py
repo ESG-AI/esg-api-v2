@@ -1,5 +1,5 @@
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body, Depends
 import google.generativeai as genai
 import fitz
 import json
@@ -12,13 +12,14 @@ import base64
 import tempfile
 import time
 from fastapi.middleware.cors import CORSMiddleware
-from neon import init_db, save_analysis_results, get_document_analysis, get_all_documents
+from neon import AnalysisResult, SessionLocal, init_db, save_analysis_results, get_document_analysis, get_all_documents, Document
 from datetime import datetime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import JSONB
-from aws import upload_to_s3
+from aws import upload_to_s3, get_pdf_from_s3
 import logging
+from pydantic import BaseModel
 
 
 app = FastAPI()
@@ -161,39 +162,61 @@ def check_extraction_quality(extracted_text, pdf_reader):
     
     return diagnostics
 
+@app.post("/upload")
+async def upload_pdf(pdf: UploadFile = File(...)):
+    """
+    Upload a PDF to S3 and return the S3 object key.
+    """
+    try:
+        pdf_content = await pdf.read()
+        from aws import upload_to_s3
+        s3_object_key = await upload_to_s3(pdf_content, pdf.filename)
+        if not s3_object_key:
+            raise HTTPException(status_code=500, detail="Failed to upload document to S3")
+        return {"s3_object_key": s3_object_key}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+class EvaluateRequest(BaseModel):
+    s3_object_key: Optional[str] = None
+    filename: Optional[str] = None
+
 @app.post("/evaluate")
 async def evaluate_pdf(
-    pdf: UploadFile = File(...),
-    document_type: str = "sustainability_report"
+    request: EvaluateRequest = Body(...),
+    document_type: str = "sustainability_report",
+    gri_type: Optional[str] = Query(None, description="One of: governance, economic, social, environmental")
     ):
     """
-    Evaluate a single PDF against all ESG indices with specified document type.
-    
-    Args:
-        pdf: The PDF file to analyze
-        document_type: Document type (sustainability_report, annual_report, or financial_statement)
-        
-    Returns:
-        Complete analysis results with scores for all indices
+    Evaluate a single PDF against all ESG indices with specified document type or only those of a specific GRI type.
+    Accepts only an existing S3 object key in the request body.
     """
     # Validate document type
     if document_type not in ["sustainability_report", "annual_report", "financial_statement"]:
         document_type = "sustainability_report"  # Default if invalid type provided
-      
+    
+    # Filter indices by gri_type if provided
+    if gri_type:
+        indices_to_process = [code for code, rule in scoring_rules.items() if rule["types"] == gri_type]
+    else:
+        indices_to_process = list(scoring_rules.keys())
+    
     # Track overall processing time
     start_time = time.time()
 
     try:
-        pdf_content = await pdf.read()
+        s3_object_key = request.s3_object_key
+        filename = request.filename
+        if s3_object_key:
+            from aws import get_pdf_from_s3
+            pdf_content = await get_pdf_from_s3(s3_object_key)
+            s3_object_key_final = s3_object_key
+            s3_upload_time = 0
+        else:
+            raise HTTPException(status_code=400, detail="Must provide an S3 object key in the request body")
 
-        # S3 upload timing
-        s3_upload_start = time.time()
-        from aws import upload_to_s3
-        s3_object_key = await upload_to_s3(pdf_content, pdf.filename)
-        s3_upload_time = time.time() - s3_upload_start
-        
-        if not s3_object_key:
-            raise HTTPException(status_code=500, detail="Failed to upload document to S3")
+        # Use provided filename or fallback to s3_object_key
+        filename_to_save = filename if filename else s3_object_key_final
 
         # Extraction timing
         extraction_start = time.time()
@@ -223,9 +246,10 @@ async def evaluate_pdf(
         ai_processing_times = {}
         ai_evaluation_start = time.time()
         
-        # Evaluate against all indicators with individual API calls for each index
+        # Evaluate only the selected indices
         results = {}
-        for indicator_code, indicator in scoring_rules.items():
+        for indicator_code in indices_to_process:
+            indicator = scoring_rules[indicator_code]
             try:
                 await asyncio.sleep(1)  # Rate limiting for API calls
 
@@ -274,45 +298,42 @@ async def evaluate_pdf(
         # Calculate summary scores by category
         summary = calculate_summary_scores(results)
 
-        # Database save timing
-        db_save_start = time.time()
-        document_id = save_analysis_results(
-            filename=pdf.filename,
-            s3_object_key=s3_object_key,
-            file_size=file_size,
-            extraction_quality=extraction_quality,
-            results=results,
-            summary=summary,
-            token_usage=token_usage_by_indicator,
-            performance_metrics=None  # Will update below
-        )
-        db_save_time = time.time() - db_save_start
-
         # Calculate total processing time
         total_time = time.time() - start_time
-        
-        # Add timing metrics to response
-        timing_metrics = {
-            "total_processing_time_seconds": round(total_time, 2),
-            "s3_upload_time_seconds": round(s3_upload_time, 2),
-            "extraction_time_seconds": round(extraction_time, 2),
-            "extraction_quality_check_time_seconds": round(quality_check_time, 2),
-            "ai_evaluation_time_seconds": round(ai_evaluation_time, 2),
-            "indicator_processing_times": ai_processing_times,
-            "db_save_time_seconds": round(db_save_time, 2)
-        }
 
         # Prepare token usage data
         token_usage_data = {
             "total_tokens_used": total_tokens_used,
             "by_indicator": token_usage_by_indicator
         }
+        
+        # Add timing metrics to response
+        timing_metrics = {
+            "total_processing_time_seconds": round(total_time, 2),
+            "s3_upload_time_seconds": s3_upload_time,
+            "extraction_time_seconds": round(extraction_time, 2),
+            "extraction_quality_check_time_seconds": round(quality_check_time, 2),
+            "ai_evaluation_time_seconds": round(ai_evaluation_time, 2),
+            "indicator_processing_times": ai_processing_times
+        }
 
+        document_id = save_analysis_results(
+            filename=filename_to_save,
+            s3_object_key=s3_object_key_final,
+            file_size=file_size,
+            extraction_quality=extraction_quality,
+            results=results,
+            summary=summary,
+            token_usage=token_usage_by_indicator,
+            performance_metrics=timing_metrics
+        )
+        
         return {
             "id": document_id,
-            "filename": pdf.filename,
+            "filename": filename_to_save,
             "document_type": document_type,
-            "s3_object_key": s3_object_key,
+            "gri_type": gri_type,
+            "s3_object_key": s3_object_key_final,
             "extraction_quality": extraction_quality,
             "extraction_warning": extraction_warning,
             "indicators": results,
@@ -451,182 +472,210 @@ async def evaluate_indicator(text, indicator_code, indicator):
         logger.error(f"Error in Gemini evaluation for {indicator_code}: {str(e)}")
         return 0, f"Error: {str(e)}", {"total_tokens": prompt_token_count, "prompt_tokens": prompt_token_count, "response_tokens": 0}
 
+class EvaluateMultiRequest(BaseModel):
+    s3_object_keys: List[str]
+    filenames: Optional[List[str]] = None
+    document_types: Optional[List[str]] = None
+
 @app.post("/evaluate-multi")
 async def evaluate_multi_documents(
-    files: List[UploadFile] = File(...),
-    document_types: List[str] = None
+    request: EvaluateMultiRequest = Body(...),
+    gri_type: Optional[str] = Query(None, description="One of: governance, economic, social, environmental")
 ):
     """
-    Process multiple documents with client-specified document types.
+    Process multiple documents using existing S3 object keys with client-specified document types and GRI type filtering.
     
     Each document type should be one of: 'sustainability_report', 'annual_report', 'financial_statement'
     If document_types is not provided, all documents will be treated as 'sustainability_report'
+    If gri_type is provided, only indicators of that type will be evaluated
     """
+    # Validate document type
+    if request.document_types:
+        for doc_type in request.document_types:
+            if doc_type and doc_type not in ["sustainability_report", "annual_report", "financial_statement"]:
+                raise HTTPException(status_code=400, detail=f"Invalid document type: {doc_type}")
+    
+    # Filter indices by gri_type if provided
+    if gri_type:
+        indices_to_process = [code for code, rule in scoring_rules.items() if rule["types"] == gri_type]
+    else:
+        indices_to_process = list(scoring_rules.keys())
+    
     # Track overall processing time
     start_time = time.time()
-    
-    documents = []
-    file_details = []
-    
-    # Track extraction time
-    extraction_start = time.time()
-    # Process each document
-    for i, file in enumerate(files):
-        content = await file.read()
+
+    try:
+        documents = []
+        file_details = []
         
-        # Upload to S3 (similar to evaluate endpoint)
-        s3_object_key = await upload_to_s3(content, file.filename)
+        # Track extraction time
+        extraction_start = time.time()
         
-        if not s3_object_key:
-            raise HTTPException(status_code=500, detail=f"Failed to upload document {file.filename} to S3")
-        
-        # Extract text from the document
-        extracted_text = await extract_pdf_text(content)
-        
-        # Get extraction quality
-        pdf_file = io.BytesIO(content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
-        
-        # Use client-provided document type or default to sustainability_report
-        doc_type = "sustainability_report"  # Default type
-        if document_types and i < len(document_types) and document_types[i]:
-            # Validate the document type
-            if document_types[i] in ["sustainability_report", "annual_report", "financial_statement"]:
-                doc_type = document_types[i]
+        # Process each S3 object key
+        for i, s3_object_key in enumerate(request.s3_object_keys):
+            # Get PDF content from S3
+            pdf_content = await get_pdf_from_s3(s3_object_key)
             
-        # Store file details for database
-        file_details.append({
-            "filename": file.filename,
-            "s3_object_key": s3_object_key,
-            "file_size": len(content),
-            "extraction_quality": extraction_quality,
-            "document_type": doc_type
-        })
+            if not pdf_content:
+                raise HTTPException(status_code=404, detail=f"Failed to retrieve document from S3: {s3_object_key}")
+            
+            # Extract text from the document
+            extracted_text = await extract_pdf_text(pdf_content)
+            
+            # Get extraction quality
+            pdf_file = io.BytesIO(pdf_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
+            
+            # Use client-provided document type or default to sustainability_report
+            doc_type = "sustainability_report"  # Default type
+            if request.document_types and i < len(request.document_types) and request.document_types[i]:
+                # Validate the document type
+                if request.document_types[i] in ["sustainability_report", "annual_report", "financial_statement"]:
+                    doc_type = request.document_types[i]
+            
+            # Use provided filename or fallback to s3_object_key
+            filename = s3_object_key
+            if request.filenames and i < len(request.filenames) and request.filenames[i]:
+                filename = request.filenames[i]
+            
+            # Store file details for database
+            file_details.append({
+                "filename": filename,
+                "s3_object_key": s3_object_key,
+                "file_size": len(pdf_content),
+                "extraction_quality": extraction_quality,
+                "document_type": doc_type
+            })
+            
+            documents.append({
+                "filename": filename,
+                "text": extracted_text,
+                "type": doc_type
+            })
         
-        documents.append({
-            "filename": file.filename,
-            "text": extracted_text,
-            "type": doc_type
-        })
-    
-    extraction_time = time.time() - extraction_start
-    
-    # Track token usage across all evaluations
-    total_tokens_used = 0
-    token_usage_by_indicator = {}
-    
-    # Track AI processing times for each indicator
-    ai_processing_times = {}
-    
-    # Build context for each indicator based on document types
-    results = {}
-    for indicator_code, indicator in scoring_rules.items():
-        # Track time for this specific indicator
-        indicator_start = time.time()
+        extraction_time = time.time() - extraction_start
         
-        # Select appropriate document or documents for this indicator
-        context = build_indicator_context(documents, indicator)
+        # Track token usage across all evaluations
+        total_tokens_used = 0
+        token_usage_by_indicator = {}
         
-        # Evaluate the indicator with the selected context
-        score, reasoning, token_count = await evaluate_indicator_with_context(context, indicator_code, indicator)
+        # Track AI processing times for each indicator
+        ai_processing_times = {}
+        ai_evaluation_start = time.time()
         
-        # Calculate and store processing time
-        indicator_time = time.time() - indicator_start
-        ai_processing_times[indicator_code] = round(indicator_time, 2)
+        # Build context for each indicator based on document types
+        results = {}
+        for indicator_code in indices_to_process:
+            indicator = scoring_rules[indicator_code]
+            try:
+                await asyncio.sleep(1)  # Rate limiting for API calls
+                
+                # Track time for this specific indicator
+                indicator_start = time.time()
+                
+                # Select appropriate document or documents for this indicator
+                context = build_indicator_context(documents, indicator)
+                
+                # Evaluate the indicator with the selected context
+                score, reasoning, token_count = await evaluate_indicator_with_context(context, indicator_code, indicator)
+                
+                # Calculate and store processing time
+                indicator_time = time.time() - indicator_start
+                ai_processing_times[indicator_code] = round(indicator_time, 2)
+                
+                # Store token usage information
+                token_usage_by_indicator[indicator_code] = token_count
+                if token_count["total_tokens"]:
+                    total_tokens_used += token_count["total_tokens"]
+                
+                # Store results
+                results[indicator_code] = {
+                    "score": score,
+                    "reasoning": reasoning,
+                    "source_documents": context["source_documents"],
+                    "title": indicator["disclosure"],
+                    "type": indicator["types"],
+                    "sub_type": indicator.get("sub-title", "Unknown"),
+                    "description": indicator.get("description", ""),
+                    "token_usage": token_count
+                }
+            except Exception as e:
+                # Handle errors for individual indicators instead of failing the whole process
+                error_message = str(e)
+                if "429" in error_message:  # Rate limit error
+                    # Wait longer if we hit a rate limit
+                    await asyncio.sleep(5)
+                    # Try again for this indicator
+                    continue
+                    
+                # Log the error but continue with other indicators
+                results[indicator_code] = {
+                    "score": 0,
+                    "title": indicator.get("disclosure", "Unknown"),
+                    "type": indicator.get("types", "Unknown"),
+                    "sub_type": indicator.get("sub-title", "Unknown"),
+                    "description": indicator.get("description", ""),
+                    "error": error_message
+                }
         
-        # Store token usage information
-        token_usage_by_indicator[indicator_code] = token_count
-        if token_count["total_tokens"]:
-            total_tokens_used += token_count["total_tokens"]
+        ai_evaluation_time = time.time() - ai_evaluation_start
         
-        # Store results
-        results[indicator_code] = {
-            "score": score,
-            "reasoning": reasoning,
-            "source_documents": context["source_documents"],
-            "title": indicator["disclosure"],
-            "type": indicator["types"],
-            "sub_type": indicator.get("sub-title", "Unknown"),
-            "description": indicator.get("description", ""),
-            "token_usage": token_count
+        # Calculate summary scores by category
+        summary = calculate_summary_scores(results)
+        
+        # Calculate total processing time
+        total_time = time.time() - start_time
+        
+        # Add timing metrics to response (matching /evaluate format)
+        timing_metrics = {
+            "total_processing_time_seconds": round(total_time, 2),
+            "s3_upload_time_seconds": 0,  # Client handles uploads
+            "extraction_time_seconds": round(extraction_time, 2),
+            "extraction_quality_check_time_seconds": 0,  # Not tracked separately for multi
+            "ai_evaluation_time_seconds": round(ai_evaluation_time, 2),
+            "indicator_processing_times": ai_processing_times,
+            "db_save_time_seconds": 0  # Will be updated below
         }
-    
-    # Calculate summary scores by category
-    summary = calculate_summary_scores(results)
-    
-    # Calculate total processing time
-    total_time = time.time() - start_time
-    
-    # Add timing metrics to response
-    timing_metrics = {
-        "total_processing_time_seconds": round(total_time, 2),
-        "extraction_time_seconds": round(extraction_time, 2),
-        "ai_evaluation_time_seconds": round(sum(ai_processing_times.values()), 2),
-        "indicator_processing_times": ai_processing_times
-    }
 
-    # Prepare token usage data
-    token_usage_data = {
-        "total_tokens_used": total_tokens_used,
-        "by_indicator": token_usage_by_indicator
-    }
+        # Prepare token usage data
+        token_usage_data = {
+            "total_tokens_used": total_tokens_used,
+            "by_indicator": token_usage_by_indicator
+        }
 
-    #Save main document to database (using first file as primary document)
-    if file_details:
-        document_id = save_analysis_results(
-            filename=file_details[0]["filename"],
-            s3_object_key=file_details[0]["s3_object_key"],
-            file_size=file_details[0]["file_size"],
-            extraction_quality=file_details[0]["extraction_quality"],
-            results=results,
-            summary=summary,
-            token_usage=token_usage_data,
-            performance_metrics=timing_metrics
-        )
-    else:
-        document_id = None
-    
-    return {
-        "id": document_id,
-        "documents": [{"filename": doc["filename"], "type": doc["type"]} for doc in documents],
-        "indicators": results,
-        "summary": summary,
-        "token_usage": token_usage_data,
-        "performance_metrics": timing_metrics
-    }
-
-# def classify_document_type(text):
-#     """Classify document type based on content analysis"""
-#     # Simple rule-based classification
-#     text_lower = text.lower()
-    
-#     # Check for sustainability report indicators
-#     sustainability_terms = ["sustainability report", "esg report", "environmental, social", 
-#                           "carbon footprint", "greenhouse gas emissions", "gri standards"]
-#     sustainability_score = sum(1 for term in sustainability_terms if term in text_lower)
-    
-#     # Check for annual report indicators
-#     annual_report_terms = ["annual report", "financial year", "dear shareholders", 
-#                          "board of directors", "financial statements", "corporate governance"]
-#     annual_report_score = sum(1 for term in annual_report_terms if term in text_lower)
-    
-#     # Check for financial statement indicators
-#     financial_terms = ["balance sheet", "income statement", "cash flow statement", 
-#                      "statement of financial position", "notes to financial statements"]
-#     financial_score = sum(1 for term in financial_terms if term in text_lower)
-    
-#     # Determine document type based on highest score
-#     max_score = max(sustainability_score, annual_report_score, financial_score)
-    
-#     if max_score == 0:
-#         return "unknown"
-#     elif max_score == sustainability_score:
-#         return "sustainability_report"
-#     elif max_score == annual_report_score:
-#         return "annual_report"
-#     else:
-#         return "financial_statement"
+        # Save main document to database (using first file as primary document)
+        db_save_start = time.time()
+        if file_details:
+            document_id = save_analysis_results(
+                filename=file_details[0]["filename"],
+                s3_object_key=file_details[0]["s3_object_key"],
+                file_size=file_details[0]["file_size"],
+                extraction_quality=file_details[0]["extraction_quality"],
+                results=results,
+                summary=summary,
+                token_usage=token_usage_by_indicator,
+                performance_metrics=timing_metrics
+            )
+        else:
+            document_id = None
+        
+        db_save_time = time.time() - db_save_start
+        timing_metrics["db_save_time_seconds"] = round(db_save_time, 2)
+        
+        return {
+            "id": document_id,
+            "documents": [{"filename": doc["filename"], "type": doc["type"]} for doc in documents],
+            "gri_type": gri_type,
+            "indicators": results,
+            "summary": summary,
+            "token_usage": token_usage_data,
+            "performance_metrics": timing_metrics
+        }
+    except Exception as e:
+        # Calculate time even for errors
+        error_time = time.time() - start_time
+        raise HTTPException(status_code=500, detail=f"Error processing documents: {str(e)}")
 
 def build_indicator_context(documents, indicator):
     """
@@ -889,12 +938,54 @@ async def extract_pdf_text(pdf_content):
 # Related to Database endpoints
 @app.get("/documents")
 async def list_documents(limit: int = 100, offset: int = 0):
-    """Get a list of all analyzed documents"""
+    """Get a list of all analyzed documents with individual indicator scores and SPDI index"""
     try:
-        documents = get_all_documents(limit, offset)
-        return {"documents": documents, "count": len(documents)}
+        with SessionLocal() as session:
+            # Build base query for Documents
+            query = session.query(Document).order_by(Document.id.desc())
+            
+            # Get total count BEFORE pagination
+            total_count = query.count()
+            
+            # Apply pagination
+            documents = query.offset(offset).limit(limit).all()
+            
+            result = []
+            for doc in documents:
+                # Get all indicator scores for this document
+                indicators = {}
+                for indicator in doc.analysis_results:
+                    indicators[indicator.indicator_code] = {
+                        "score": indicator.score,
+                        "title": indicator.indicator_title,
+                        "type": indicator.indicator_type,
+                        "subtype": indicator.indicator_subtype,
+                        "description": indicator.indicator_description,
+                        "reasoning": indicator.reasoning
+                    }
+                
+                # Get SPDI index score from score_summary
+                spdi_index = doc.score_summary.spdi_index_score if doc.score_summary else 0
+                
+                # Create a document entry with detailed indicator scores and SPDI index
+                doc_entry = {
+                    "id": doc.id,
+                    "filename": doc.filename,
+                    "created_at": doc.upload_date.isoformat(),
+                    "file_size": doc.file_size,
+                    "spdi_index": spdi_index,
+                    # All individual indicator scores
+                    "indicators": indicators
+                }
+                result.append(doc_entry)
+                
+            return {
+                "documents": result,
+                "count": total_count  # Total documents in database, not just current page
+            }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving documents: {str(e)}")
+        print(f"Error getting documents: {e}")
+        return {"documents": [], "count": 0}
 
 @app.get("/documents/{document_id}")
 async def get_document(document_id: int):
@@ -955,6 +1046,72 @@ async def get_categories():
         })
     
     return categories
+
+class UpdateAnalysisResultRequest(BaseModel):
+    score: Optional[int] = None
+    reasoning: Optional[str] = None
+
+@app.patch("/documents/{document_id}/indicator/{indicator_code}")
+async def update_analysis_result(
+    document_id: int,
+    indicator_code: str,
+    update: UpdateAnalysisResultRequest
+):
+    """
+    Update an analysis result for a specific document and indicator code.
+    """
+    db = SessionLocal()
+    try:
+        # Find the analysis result
+        ar = db.query(AnalysisResult).filter(
+            AnalysisResult.document_id == document_id,
+            AnalysisResult.indicator_code == indicator_code
+        ).first()
+        
+        if not ar:
+            raise HTTPException(status_code=404, detail=f"AnalysisResult not found for document {document_id} and indicator {indicator_code}")
+        
+        # Update the fields that were provided
+        update_data = update.dict(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(ar, field, value)
+        
+        # Validate score if provided
+        if 'score' in update_data and (update_data['score'] < 0 or update_data['score'] > 4):
+            raise HTTPException(status_code=400, detail="Score must be between 0 and 4")
+        
+        db.commit()
+        
+        # Recalculate the SPDI index for the document
+        total_spdi_index = sum(r.score for r in db.query(AnalysisResult).filter(AnalysisResult.document_id == document_id))
+        
+        # Update the score summary
+        if ar.document.score_summary:
+            ar.document.score_summary.spdi_index_score = total_spdi_index
+        else:
+            # Create score summary if it doesn't exist
+            from neon import ScoreSummary
+            score_summary = ScoreSummary(
+                document_id=document_id,
+                spdi_index_score=total_spdi_index
+            )
+            db.add(score_summary)
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": f"AnalysisResult updated successfully for indicator {indicator_code}",
+            "updated_spdi_index": total_spdi_index
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error updating analysis result: {str(e)}")
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn
