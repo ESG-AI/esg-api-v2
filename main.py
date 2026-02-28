@@ -1,6 +1,7 @@
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body, Depends
 import google.generativeai as genai
+from openai import AsyncOpenAI
 import fitz
 import json
 import os
@@ -11,6 +12,10 @@ from PIL import Image
 import base64
 import tempfile
 import time
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi.middleware.cors import CORSMiddleware
 from neon import AnalysisResult, SessionLocal, init_db, save_analysis_results, get_document_analysis, get_all_documents, Document
 from datetime import datetime
@@ -37,6 +42,9 @@ async def startup_db_client():
     init_db()
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+
+# Initialize Async OpenAI Client
+openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 print(f"Gemini SDK version: {genai.__version__}")
 
@@ -346,15 +354,12 @@ async def evaluate_pdf(
         error_time = time.time() - start_time
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
 
-async def evaluate_indicator(text, indicator_code, indicator):
+async def evaluate_indicator(text, indicator_code, indicator, model_name="gpt-4o-mini"):
     """
-    Evaluate a specific ESG indicator using Gemini AI with keyword-based context extraction.
+    Evaluate a specific ESG indicator using OpenAI Chat Completions API with keyword-based context extraction.
     Finds the most relevant parts of the document by locating ESG index keywords.
     Returns both score and token usage information.
     """
-    
-    # Configure Gemini model for this specific evaluation
-    model = genai.GenerativeModel('gemini-1.5-pro')
     
     # Find the most relevant sections of text based on keywords
     keywords = indicator['keywords']
@@ -400,50 +405,55 @@ async def evaluate_indicator(text, indicator_code, indicator):
         combined_text = combined_text[:8000]
     
     # Update prompt to request both score and reasoning
-    prompt = f"""
-    You are an ESG (Environmental, Social, Governance) scoring expert. 
-    Analyze the following sustainability report extract against the indicator: {indicator_code} - {indicator['disclosure']}.
-    
-    Indicator description: {indicator['description']}
-    
-    Relevant keywords to look for: {', '.join(indicator['keywords'])}
-    
-    Scoring criteria:
-    0: {indicator['criteria']['0']}
-    1: {indicator['criteria'].get('1', 'Not specified')}
-    2: {indicator['criteria'].get('2', 'Not specified')}
-    3: {indicator['criteria'].get('3', 'Not specified')}
-    4: {indicator['criteria']['4']}
-    """
+    system_prompt = f"""You are an ESG (Environmental, Social, Governance) scoring expert. 
+Analyze the following sustainability report extract against the indicator: {indicator_code} - {indicator['disclosure']}.
+
+Indicator description: {indicator['description']}
+
+Relevant keywords to look for: {', '.join(indicator['keywords'])}
+
+Scoring criteria:
+0: {indicator['criteria']['0']}
+1: {indicator['criteria'].get('1', 'Not specified')}
+2: {indicator['criteria'].get('2', 'Not specified')}
+3: {indicator['criteria'].get('3', 'Not specified')}
+4: {indicator['criteria']['4']}
+"""
 
      # Add reference examples if available
     if "references" in indicator:
-        prompt += "\n\nREFERENCE EXAMPLES FOR EACH SCORE LEVEL:\n"
+        system_prompt += "\n\nREFERENCE EXAMPLES FOR EACH SCORE LEVEL:\n"
         
         for score in sorted([s for s in indicator["references"].keys() if s.isdigit()]):
             if indicator["references"].get(score):
-                prompt += f"\n--- EXAMPLE FOR SCORE {score} ---\n"
-                prompt += f"{indicator['references'][score]}\n"
+                system_prompt += f"\n--- EXAMPLE FOR SCORE {score} ---\n"
+                system_prompt += f"{indicator['references'][score]}\n"
     
      # Add instructions and text to analyze
-    prompt += f"""
-    Based on the examples and scoring criteria above, assign a score from 0-4 to the following text.
-    
-    First give your score as a single digit (0-4), then on a new line provide your explanation.
-    
-    TEXT TO ANALYZE:
-    {combined_text}
-    """
+    system_prompt += """
+Based on the examples and scoring criteria above, assign a score from 0-4 to the following text.
 
-    # Get token count for the prompt before sending
-    prompt_token_count = model.count_tokens(prompt).total_tokens
-    
-    # Send request to Gemini
+First give your score as a single digit (0-4), then on a new line provide your explanation.
+"""
+
+    user_prompt = f"""
+TEXT TO ANALYZE:
+{combined_text}
+"""
+
+    # Send request to OpenAI
     try:
-        response = await model.generate_content_async(prompt)
+        response = await openai_client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,  # Keep temperature low for deterministic scoring
+        )
         
         # Parse response to extract score and reasoning
-        response_text = response.text.strip()
+        response_text = response.choices[0].message.content.strip()
         lines = response_text.split("\n", 1)
         
         # Extract score from first line
@@ -458,19 +468,19 @@ async def evaluate_indicator(text, indicator_code, indicator):
         
         # Get token usage
         token_count = {
-            "total_tokens": prompt_token_count + (len(response_text) // 4),
-            "prompt_tokens": prompt_token_count,
-            "response_tokens": len(response_text) // 4
+            "total_tokens": response.usage.total_tokens,
+            "prompt_tokens": response.usage.prompt_tokens,
+            "response_tokens": response.usage.completion_tokens
         }
         
         # Log the response
-        logger.info(f"Gemini Response for {indicator_code}:\nScore: {score}\nReasoning: {reasoning}\nToken Usage: {token_count}")
+        logger.info(f"OpenAI Response for {indicator_code} ({model_name}):\nScore: {score}\nReasoning: {reasoning}\nToken Usage: {token_count}")
         
         return score, reasoning, token_count
         
     except Exception as e:
-        logger.error(f"Error in Gemini evaluation for {indicator_code}: {str(e)}")
-        return 0, f"Error: {str(e)}", {"total_tokens": prompt_token_count, "prompt_tokens": prompt_token_count, "response_tokens": 0}
+        logger.error(f"Error in OpenAI evaluation for {indicator_code}: {str(e)}")
+        return 0, f"Error: {str(e)}", {"total_tokens": 0, "prompt_tokens": 0, "response_tokens": 0}
 
 class EvaluateMultiRequest(BaseModel):
     s3_object_keys: List[str]
@@ -732,7 +742,7 @@ def build_indicator_context(documents, indicator):
     context["combined_text"] = all_text
     return context
 
-async def evaluate_indicator_with_context(context, indicator_code, indicator):
+async def evaluate_indicator_with_context(context, indicator_code, indicator, model_name="gpt-4o-mini"):
     """
     Evaluate an indicator using context built from multiple documents.
     
@@ -740,6 +750,7 @@ async def evaluate_indicator_with_context(context, indicator_code, indicator):
         context: Context object with text and metadata
         indicator_code: Code of the indicator to evaluate
         indicator: The indicator configuration
+        model_name: The OpenAI model to use (default: gpt-4o-mini)
         
     Returns:
         tuple: (score, reasoning, token_count)
@@ -790,44 +801,47 @@ async def evaluate_indicator_with_context(context, indicator_code, indicator):
     if len(combined_text) > 8000:
         combined_text = combined_text[:8000]
     
-    # Use the existing evaluation logic from here (almost identical to evaluate_indicator)
-    model = genai.GenerativeModel('gemini-1.5-pro')
-    
     # Create evaluation prompt
-    prompt = f"""
-    You are an ESG (Environmental, Social, Governance) scoring expert. 
-    Analyze the following extracted text against the indicator: {indicator_code} - {indicator['disclosure']}.
-    
-    Indicator description: {indicator['description']}
-    
-    Relevant keywords to look for: {', '.join(indicator['keywords'])}
-    
-    Scoring criteria:
-    0: {indicator['criteria']['0']}
-    1: {indicator['criteria'].get('1', 'Not specified')}
-    2: {indicator['criteria'].get('2', 'Not specified')}
-    3: {indicator['criteria'].get('3', 'Not specified')}
-    4: {indicator['criteria']['4']}
-    
-    Based on the text below, assign a score from 0-4 and provide a brief explanation (2-3 sentences) justifying your score.
-    
-    First give your score as a single digit (0-4), then on a new line provide your explanation.
-    
-    Example:
-    3
-    The text clearly describes procedures for waste management including recycling programs. It provides quantitative data on waste reduction but lacks complete information on circular economy implementation.
-    
-    {combined_text}
-    """
-    
-    # Get token count and make API request
-    prompt_token_count = model.count_tokens(prompt).total_tokens
+    system_prompt = f"""You are an ESG (Environmental, Social, Governance) scoring expert. 
+Analyze the following extracted text against the indicator: {indicator_code} - {indicator['disclosure']}.
+
+Indicator description: {indicator['description']}
+
+Relevant keywords to look for: {', '.join(indicator['keywords'])}
+
+Scoring criteria:
+0: {indicator['criteria']['0']}
+1: {indicator['criteria'].get('1', 'Not specified')}
+2: {indicator['criteria'].get('2', 'Not specified')}
+3: {indicator['criteria'].get('3', 'Not specified')}
+4: {indicator['criteria']['4']}
+
+Based on the text provided by the user, assign a score from 0-4 and provide a brief explanation (2-3 sentences) justifying your score.
+
+First give your score as a single digit (0-4), then on a new line provide your explanation.
+
+Example:
+3
+The text clearly describes procedures for waste management including recycling programs. It provides quantitative data on waste reduction but lacks complete information on circular economy implementation.
+"""
+
+    user_prompt = f"""
+TEXT TO ANALYZE:
+{combined_text}
+"""
     
     try:
-        response = await model.generate_content_async(prompt)
+        response = await openai_client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+        )
         
         # Parse response to extract score and reasoning
-        response_text = response.text.strip()
+        response_text = response.choices[0].message.content.strip()
         lines = response_text.split("\n", 1)
         
         # Extract score from first line
@@ -842,15 +856,15 @@ async def evaluate_indicator_with_context(context, indicator_code, indicator):
         
         # Get token usage
         token_count = {
-            "total_tokens": prompt_token_count + (len(response_text) // 4),
-            "prompt_tokens": prompt_token_count,
-            "response_tokens": len(response_text) // 4
+            "total_tokens": response.usage.total_tokens,
+            "prompt_tokens": response.usage.prompt_tokens,
+            "response_tokens": response.usage.completion_tokens
         }
         
         return score, reasoning, token_count
         
     except Exception as e:
-        return 0, f"Error: {str(e)}", {"total_tokens": prompt_token_count, "prompt_tokens": prompt_token_count, "response_tokens": 0}
+        return 0, f"Error: {str(e)}", {"total_tokens": 0, "prompt_tokens": 0, "response_tokens": 0}
 
 def calculate_summary_scores(results):
     """Calculate summary scores by category"""

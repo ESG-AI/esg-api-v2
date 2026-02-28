@@ -4,14 +4,14 @@ A powerful backend service for automated Environmental, Social, and Governance (
 
 ## Overview
 
-This project provides an API for evaluating sustainability reports and other corporate documents against standardized ESG indicators based on the Global Reporting Initiative (GRI) framework. It leverages Google's Gemini AI models to analyze documents and provide quantitative scores with qualitative reasoning.
+This project provides an API for evaluating sustainability reports and other corporate documents against standardized ESG indicators based on the Global Reporting Initiative (GRI) framework. It leverages OpenAI and Google's Gemini AI models to analyze documents and provide quantitative scores with qualitative reasoning.
 
 ## Key Features
 
 - **Automated ESG Scoring**: Evaluate documents against 40+ GRI indicators
 - **Multi-document Analysis**: Process sustainability reports, annual reports, and financial statements together
 - **Document Type Intelligence**: Selects the appropriate document for each indicator based on content type
-- **OCR Capability**: Extracts text from scanned PDFs using Gemini's image processing
+- **OCR Capability**: Extracts text from scanned PDFs using OpenAI or Gemini's image processing capabilities
 - **Reference-based Scoring**: Uses real-world examples for consistent scoring benchmarks
 - **Detailed Reasoning**: Provides explanations for each score to ensure transparency
 - **Document Storage**: Saves uploaded documents to S3 for future reference
@@ -25,7 +25,8 @@ This project provides an API for evaluating sustainability reports and other cor
 - Python 3.10+
 - PostgreSQL database (or Neon.tech account)
 - AWS S3 bucket
-- Google AI API key (for Gemini)
+- OpenAI API key
+- Google AI API key (if using Gemini models)
 
 ### Setup
 
@@ -150,6 +151,19 @@ curl -X POST http://localhost:8000/evaluate -F "file=@sustainability_report.pdf"
 curl -X POST http://localhost:8000/evaluate-multi -F "files=@report1.pdf,@report2.pdf"
 ```
 
+### Batch Processing (Local)
+
+For testing and local evaluation, a standalone batch script (`batch_process.py`) is provided. This script evaluates a folder of PDFs simultaneously using OpenAI's model and outputs the individual indicator scores to a CSV file.
+
+To run batch scoring locally:
+1. Ensure you have a directory named `test_pdfs` in the root of the project.
+2. Put your input PDF files into the `test_pdfs` folder.
+3. Run the batch script command:
+   ```bash
+   python batch_process.py
+   ```
+4. Once completed, the result will be saved as a `batch_results.csv` file in the project root containing the evaluation scores for each document.
+
 ## Scoring System
 
 The scoring system is based on the GRI standards framework and uses a 0-4 scale:
@@ -165,15 +179,24 @@ Each indicator has specific scoring criteria defined in the `scoring_rules.json`
 ## Technical Architecture
 
 - **FastAPI**: Web framework for API endpoints
-- **Google Gemini AI**: For document analysis and scoring
+- **OpenAI & Google Gemini**: For document analysis and scoring
 - **PyPDF2 & PyMuPDF**: PDF text extraction
 - **SQLAlchemy**: Database ORM
 - **Neon PostgreSQL**: Database storage
 - **AWS S3**: Document storage
 
-### Available Gemini Models
+### Available AI Models
 
-The system uses the `gemini-1.5-pro` model for:
+The system supports multiple AI models for evaluation:
+
+**OpenAI (Default):**
+- `gpt-4o-mini` (used for large batch processing)
+- `gpt-4o`
+
+**Google Gemini:**
+- `gemini-1.5-pro`
+
+These models are used for:
 
 - ESG analysis and scoring
 - OCR processing of scanned documents
