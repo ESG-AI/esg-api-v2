@@ -40,8 +40,8 @@ This project provides an API for evaluating sustainability reports and other cor
 2. Create and activate a virtual environment:
 
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
 3. Install dependencies:
@@ -52,11 +52,6 @@ This project provides an API for evaluating sustainability reports and other cor
 
 4. Set up environment variables:  
    Create a `.env` file with the required configurations (e.g., database URL, S3 credentials, API keys).
-
-5. Initialize the database:
-   ```bash
-   alembic upgrade head
-   ```
 
 ## Usage
 

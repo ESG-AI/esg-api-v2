@@ -158,8 +158,8 @@ def export_to_csv(results):
         headers.append(f"Score: {code}")
         
     # Optional: Add reasoning columns at the end if you want human comparison notes
-    # for code in sorted_indicator_codes:
-    #     headers.append(f"Reasoning: {code}")
+    for code in sorted_indicator_codes:
+        headers.append(f"Reasoning: {code}")
         
     with open(OUTPUT_CSV_FILE, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
@@ -179,9 +179,9 @@ def export_to_csv(results):
                 row.append(indicator_data.get("score", "N/A"))
                 
             # Map reasoning logic
-            # for code in sorted_indicator_codes:
-            #     indicator_data = result["indicators"].get(code, {})
-            #     row.append(indicator_data.get("reasoning", "N/A"))
+            for code in sorted_indicator_codes:
+                indicator_data = result["indicators"].get(code, {})
+                row.append(indicator_data.get("reasoning", "N/A"))
                 
             writer.writerow(row)
 
