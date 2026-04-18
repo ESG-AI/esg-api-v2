@@ -1,6 +1,7 @@
 # Core API
 fastapi==0.115.12
 uvicorn==0.34.0
+gunicorn
 python-multipart==0.0.20
 starlette==0.46.1
 
