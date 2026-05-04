@@ -26,6 +26,7 @@ class Document(Base):
     upload_date = Column(DateTime, default=datetime.utcnow)
     s3_object_key = Column(String)
     file_size = Column(Integer)
+    user_id = Column(String, index=True, nullable=True)
     extraction_quality = Column(JSONB)
     token_usage = Column(JSONB)
     performance_metrics = Column(JSONB)
@@ -66,7 +67,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 # Database operations
-def save_analysis_results(filename, s3_object_key, file_size, extraction_quality, results, summary, token_usage, performance_metrics):
+def save_analysis_results(filename, s3_object_key, file_size, extraction_quality, results, summary, token_usage, performance_metrics, user_id=None):
     """
     Save or update analysis results in the database for a given S3 object key.
     If a Document with the same s3_object_key exists, update it with new indicator results.
@@ -77,11 +78,12 @@ def save_analysis_results(filename, s3_object_key, file_size, extraction_quality
         # Try to find an existing document with the same S3 key
         document = db.query(Document).filter(Document.s3_object_key == s3_object_key).first()
         if document:
-            # Update document metadata (optional: update filename, file_size, extraction_quality, etc.)
             document.filename = filename
             document.file_size = file_size
             document.extraction_quality = extraction_quality
             document.token_usage = token_usage
+            if user_id:
+                document.user_id = user_id
             # Sum total_processing_time_seconds if present
             old_metrics = document.performance_metrics or {}
             new_metrics = performance_metrics or {}
@@ -156,6 +158,7 @@ def save_analysis_results(filename, s3_object_key, file_size, extraction_quality
                 filename=filename,
                 s3_object_key=s3_object_key,
                 file_size=file_size,
+                user_id=user_id,
                 extraction_quality=extraction_quality,
                 token_usage=token_usage,
                 performance_metrics=performance_metrics
@@ -242,11 +245,15 @@ def get_document_analysis(document_id):
     finally:
         db.close()
 
-def get_all_documents(limit=100, offset=0):
+def get_all_documents(limit=100, offset=0, user_id=None):
     """Get a list of all analyzed documents with individual indicator scores and SPDI index"""
     try:
         with SessionLocal() as session:
-            documents = session.query(Document).order_by(Document.id.desc()).offset(offset).limit(limit).all()
+            query = session.query(Document)
+            if user_id:
+                query = query.filter(Document.user_id == user_id)
+                
+            documents = query.order_by(Document.id.desc()).offset(offset).limit(limit).all()
             
             result = []
             for doc in documents:

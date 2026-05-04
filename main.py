@@ -28,6 +28,9 @@ from pydantic import BaseModel
 
 
 app = FastAPI()
+CONCURRENCY_LIMIT = 8
+BATCH_SIZE = 5
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +66,151 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger('gemini_prompts')
+
+def chunk_dict(d, size):
+    items = list(d.items())
+    for i in range(0, len(items), size):
+        yield dict(items[i:i + size])
+
+def build_batched_prompt(indicator_batch, text):
+    indicators_text = ""
+
+    for code, indicator in indicator_batch.items():
+        indicators_text += f"""
+Indicator Code: {code}
+Title: {indicator['disclosure']}
+Description: {indicator['description']}
+
+Scoring Criteria:
+0: {indicator['criteria'].get('0', '')}
+1: {indicator['criteria'].get('1', '')}
+2: {indicator['criteria'].get('2', '')}
+3: {indicator['criteria'].get('3', '')}
+4: {indicator['criteria'].get('4', '')}
+
+Relevant Keywords: {", ".join(indicator.get("keywords", []))}
+---
+"""
+
+    system_prompt = f"""
+You are an expert ESG analyst using GRI standards.
+
+Evaluate multiple ESG indicators based on the document text.
+
+Rules:
+- Assign score 0–4 STRICTLY based on criteria
+- Use ONLY information present in the text
+- If missing → give lower score
+- Do NOT hallucinate
+- Provide a detailed explanation (3-5 sentences) of why this score was given
+- You MUST reference specific quotes or parts of the text to justify your score
+- Evaluate each indicator independently
+
+Return ONLY valid JSON:
+
+{{
+  "results": [
+    {{
+      "indicator_code": "string",
+      "score": 0,
+      "reasoning": "detailed explanation referencing the text"
+    }}
+  ]
+}}
+
+Indicators:
+{indicators_text}
+"""
+
+    user_prompt = f"""
+DOCUMENT TEXT:
+{text[:200000]}
+"""
+
+    return system_prompt, user_prompt
+    
+async def evaluate_indicator_batch(openai_client, text, indicator_batch):
+    system_prompt, user_prompt = build_batched_prompt(indicator_batch, text)
+
+    response = await openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.1,
+        response_format={ "type": "json_object" }
+    )
+
+    content = response.choices[0].message.content
+    
+    token_count = {
+        "total_tokens": response.usage.total_tokens,
+        "prompt_tokens": response.usage.prompt_tokens,
+        "response_tokens": response.usage.completion_tokens
+    }
+
+    try:
+        import json
+        parsed = json.loads(content)
+        results = parsed.get("results", [])
+        
+        # Robustly handle different keys the AI might use and empty strings
+        for item in results:
+            reasoning = item.get("reasoning", "").strip()
+            if not reasoning:
+                reasoning = item.get("explanation", "").strip()
+            if not reasoning:
+                reasoning = item.get("reason", "").strip()
+            
+            if not reasoning:
+                item["reasoning"] = "No explanation provided by AI model."
+            else:
+                item["reasoning"] = reasoning
+
+        return results, token_count
+    except Exception as e:
+        import logging
+        logging.error(f"Failed to parse JSON from AI: {e}\nContent: {content}")
+        return [], token_count
+
+async def evaluate_all_indicators(openai_client, extracted_text, scoring_rules):
+    batches = list(chunk_dict(scoring_rules, BATCH_SIZE))
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+    async def process_batch(batch):
+        async with semaphore:
+            res, _ = await evaluate_indicator_batch(
+                openai_client,
+                extracted_text,
+                batch
+            )
+            return res
+
+    tasks = [process_batch(batch) for batch in batches]
+    batch_results = await asyncio.gather(*tasks)
+
+    # flatten + map back to your structure
+    final_results = {}
+
+    for batch in batch_results:
+        for item in batch:
+            code = item.get("indicator_code")
+
+            if code in scoring_rules:
+                indicator = scoring_rules[code]
+
+                final_results[code] = {
+                    "score": item.get("score", 0),
+                    "reasoning": item.get("reasoning", ""),
+                    "title": indicator["disclosure"],
+                    "type": indicator.get("types"),
+                    "sub_type": indicator.get("sub-title"),
+                    "description": indicator["description"]
+                }
+
+    return final_results
+
 
 @app.post("/extract")
 async def extract_pdf(pdf: UploadFile = File(...)):
@@ -185,174 +333,56 @@ async def upload_pdf(pdf: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
 
+@app.get("/pdf/{s3_object_key:path}")
+async def get_pdf(s3_object_key: str):
+    """
+    Retrieve a PDF from S3 and return it directly as a file response.
+    """
+    try:
+        from aws import get_pdf_from_s3
+        pdf_content = await get_pdf_from_s3(s3_object_key)
+        if not pdf_content:
+            raise HTTPException(status_code=404, detail="PDF not found in S3")
+        
+        from fastapi.responses import Response
+        return Response(content=pdf_content, media_type="application/pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving PDF: {str(e)}")
+
 class EvaluateRequest(BaseModel):
     s3_object_key: Optional[str] = None
     filename: Optional[str] = None
 
 @app.post("/evaluate")
-async def evaluate_pdf(
-    request: EvaluateRequest = Body(...),
-    document_type: str = "sustainability_report",
-    gri_type: Optional[str] = Query(None, description="One of: governance, economic, social, environmental")
-    ):
-    """
-    Evaluate a single PDF against all ESG indices with specified document type or only those of a specific GRI type.
-    Accepts only an existing S3 object key in the request body.
-    """
-    # Validate document type
-    if document_type not in ["sustainability_report", "annual_report", "financial_statement"]:
-        document_type = "sustainability_report"  # Default if invalid type provided
-    
-    # Filter indices by gri_type if provided
-    if gri_type:
-        indices_to_process = [code for code, rule in scoring_rules.items() if rule["types"] == gri_type]
-    else:
-        indices_to_process = list(scoring_rules.keys())
-    
-    # Track overall processing time
+async def evaluate_pdf(request: EvaluateRequest):
     start_time = time.time()
 
-    try:
-        s3_object_key = request.s3_object_key
-        filename = request.filename
-        if s3_object_key:
-            from aws import get_pdf_from_s3
-            pdf_content = await get_pdf_from_s3(s3_object_key)
-            s3_object_key_final = s3_object_key
-            s3_upload_time = 0
-        else:
-            raise HTTPException(status_code=400, detail="Must provide an S3 object key in the request body")
+    if not request.s3_object_key:
+        raise HTTPException(status_code=400, detail="s3_object_key is required")
 
-        # Use provided filename or fallback to s3_object_key
-        filename_to_save = filename if filename else s3_object_key_final
+    # 1. Download PDF from S3
+    pdf_content = await get_pdf_from_s3(request.s3_object_key)
+    if not pdf_content:
+        raise HTTPException(status_code=404, detail="Failed to retrieve document from S3")
 
-        # Extraction timing
-        extraction_start = time.time()
-        extracted_text = await extract_pdf_text(pdf_content)
-        extraction_time = time.time() - extraction_start
-        
-        # Extraction quality check timing
-        quality_check_start = time.time()
-        pdf_file = io.BytesIO(pdf_content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        extraction_quality = check_extraction_quality(extracted_text, pdf_reader)
-        quality_check_time = time.time() - quality_check_start
-        
-        if not extraction_quality["extraction_success"]:
-            extraction_warning = f"Warning: PDF extraction issues detected: {', '.join(extraction_quality['extraction_issues'])}"
-        else:
-            extraction_warning = None
+    # 2. Extract text
+    extracted_text = await extract_pdf_text(pdf_content)
 
-        # Get file size
-        file_size = len(pdf_content)
-        
-        # Track token usage across all evaluations
-        total_tokens_used = 0
-        token_usage_by_indicator = {}
+    # 3. Evaluate indicators
+    results = await evaluate_all_indicators(
+        openai_client,
+        extracted_text,
+        scoring_rules
+    )
 
-        # Track AI processing times for each indicator
-        ai_processing_times = {}
-        ai_evaluation_start = time.time()
-        
-        # Evaluate only the selected indices
-        results = {}
-        for indicator_code in indices_to_process:
-            indicator = scoring_rules[indicator_code]
-            try:
-                await asyncio.sleep(1)  # Rate limiting for API calls
+    # 4. Compute total score
+    total_score = sum(item.get("score", 0) for item in results.values())
 
-                # Track time for this specific indicator
-                indicator_start = time.time()
-                score, reasoning, token_count = await evaluate_indicator(extracted_text, indicator_code, indicator)
-                indicator_time = time.time() - indicator_start
-                
-                # Store timing information
-                ai_processing_times[indicator_code] = round(indicator_time, 2)
-                
-                # Store token usage information
-                token_usage_by_indicator[indicator_code] = token_count
-                if token_count["total_tokens"]:
-                    total_tokens_used += token_count["total_tokens"]
-                
-                results[indicator_code] = {
-                    "score": score,
-                    "reasoning": reasoning,
-                    "title": indicator["disclosure"],
-                    "type": indicator["types"],
-                    "sub_type": indicator["sub-title"],
-                    "description": indicator["description"],
-                    "token_usage": token_count
-                }
-            except Exception as e:
-                # Handle errors for individual indicators instead of failing the whole process
-                error_message = str(e)
-                if "429" in error_message:  # Rate limit error
-                    # Wait longer if we hit a rate limit
-                    await asyncio.sleep(5)
-                    # Try again for this indicator
-                    continue
-                    
-                # Log the error but continue with other indicators
-                results[indicator_code] = {
-                    "score": 0,
-                    "title": indicator.get("disclosure", "Unknown"),
-                    "type": indicator.get("types", "Unknown"),
-                    "sub_type": indicator.get("sub-title", "Unknown"),
-                    "description": indicator.get("description", ""),
-                    "error": error_message
-                }
-        ai_evaluation_time = time.time() - ai_evaluation_start
-        
-        # Calculate summary scores by category
-        summary = calculate_summary_scores(results)
-
-        # Calculate total processing time
-        total_time = time.time() - start_time
-
-        # Prepare token usage data
-        token_usage_data = {
-            "total_tokens_used": total_tokens_used,
-            "by_indicator": token_usage_by_indicator
-        }
-        
-        # Add timing metrics to response
-        timing_metrics = {
-            "total_processing_time_seconds": round(total_time, 2),
-            "s3_upload_time_seconds": s3_upload_time,
-            "extraction_time_seconds": round(extraction_time, 2),
-            "extraction_quality_check_time_seconds": round(quality_check_time, 2),
-            "ai_evaluation_time_seconds": round(ai_evaluation_time, 2),
-            "indicator_processing_times": ai_processing_times
-        }
-
-        document_id = save_analysis_results(
-            filename=filename_to_save,
-            s3_object_key=s3_object_key_final,
-            file_size=file_size,
-            extraction_quality=extraction_quality,
-            results=results,
-            summary=summary,
-            token_usage=token_usage_by_indicator,
-            performance_metrics=timing_metrics
-        )
-        
-        return {
-            "id": document_id,
-            "filename": filename_to_save,
-            "document_type": document_type,
-            "gri_type": gri_type,
-            "s3_object_key": s3_object_key_final,
-            "extraction_quality": extraction_quality,
-            "extraction_warning": extraction_warning,
-            "indicators": results,
-            "summary": summary,
-            "token_usage": token_usage_data,
-            "performance_metrics": timing_metrics
-        }
-    except Exception as e:
-        # Calculate time even for errors
-        error_time = time.time() - start_time
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    return {
+        "results": results,
+        "total_score": total_score,
+        "processing_time": round(time.time() - start_time, 2)
+    }
 
 async def evaluate_indicator(text, indicator_code, indicator, model_name="gpt-4o-mini"):
     """
@@ -482,10 +512,45 @@ TEXT TO ANALYZE:
         logger.error(f"Error in OpenAI evaluation for {indicator_code}: {str(e)}")
         return 0, f"Error: {str(e)}", {"total_tokens": 0, "prompt_tokens": 0, "response_tokens": 0}
 
+TEXT_CACHE = {}
+TEXT_CACHE_TTL = 600 # 10 minutes
+cache_locks = {}
+
+async def get_cached_extracted_text(s3_key: str):
+    now = time.time()
+    # Cleanup old entries
+    for k in list(TEXT_CACHE.keys()):
+        if now - TEXT_CACHE[k]['time'] > TEXT_CACHE_TTL:
+            del TEXT_CACHE[k]
+            if k in cache_locks:
+                del cache_locks[k]
+                
+    if s3_key not in cache_locks:
+        cache_locks[s3_key] = asyncio.Lock()
+        
+    async with cache_locks[s3_key]:
+        if s3_key in TEXT_CACHE:
+            print(f"Using cached OCR text for {s3_key}")
+            return TEXT_CACHE[s3_key]['text'], TEXT_CACHE[s3_key]['content']
+            
+        print(f"Downloading and extracting {s3_key}")
+        pdf_content = await get_pdf_from_s3(s3_key)
+        if not pdf_content:
+            return None, None
+            
+        extracted_text = await extract_pdf_text(pdf_content)
+        TEXT_CACHE[s3_key] = {
+            'text': extracted_text,
+            'content': pdf_content,
+            'time': now
+        }
+        return extracted_text, pdf_content
+
 class EvaluateMultiRequest(BaseModel):
     s3_object_keys: List[str]
     filenames: Optional[List[str]] = None
     document_types: Optional[List[str]] = None
+    user_id: Optional[str] = None
 
 @app.post("/evaluate-multi")
 async def evaluate_multi_documents(
@@ -523,14 +588,11 @@ async def evaluate_multi_documents(
         
         # Process each S3 object key
         for i, s3_object_key in enumerate(request.s3_object_keys):
-            # Get PDF content from S3
-            pdf_content = await get_pdf_from_s3(s3_object_key)
+            # Use cached extraction to prevent redundant OCR
+            extracted_text, pdf_content = await get_cached_extracted_text(s3_object_key)
             
             if not pdf_content:
                 raise HTTPException(status_code=404, detail=f"Failed to retrieve document from S3: {s3_object_key}")
-            
-            # Extract text from the document
-            extracted_text = await extract_pdf_text(pdf_content)
             
             # Get extraction quality
             pdf_file = io.BytesIO(pdf_content)
@@ -574,60 +636,74 @@ async def evaluate_multi_documents(
         ai_processing_times = {}
         ai_evaluation_start = time.time()
         
-        # Build context for each indicator based on document types
         results = {}
-        for indicator_code in indices_to_process:
-            indicator = scoring_rules[indicator_code]
-            try:
-                await asyncio.sleep(1)  # Rate limiting for API calls
-                
-                # Track time for this specific indicator
-                indicator_start = time.time()
-                
-                # Select appropriate document or documents for this indicator
-                context = build_indicator_context(documents, indicator)
-                
-                # Evaluate the indicator with the selected context
-                score, reasoning, token_count = await evaluate_indicator_with_context(context, indicator_code, indicator)
-                
-                # Calculate and store processing time
-                indicator_time = time.time() - indicator_start
-                ai_processing_times[indicator_code] = round(indicator_time, 2)
-                
-                # Store token usage information
-                token_usage_by_indicator[indicator_code] = token_count
-                if token_count["total_tokens"]:
-                    total_tokens_used += token_count["total_tokens"]
-                
-                # Store results
-                results[indicator_code] = {
-                    "score": score,
-                    "reasoning": reasoning,
-                    "source_documents": context["source_documents"],
-                    "title": indicator["disclosure"],
-                    "type": indicator["types"],
-                    "sub_type": indicator.get("sub-title", "Unknown"),
-                    "description": indicator.get("description", ""),
-                    "token_usage": token_count
-                }
-            except Exception as e:
-                # Handle errors for individual indicators instead of failing the whole process
-                error_message = str(e)
-                if "429" in error_message:  # Rate limit error
-                    # Wait longer if we hit a rate limit
-                    await asyncio.sleep(5)
-                    # Try again for this indicator
-                    continue
+        
+        # Build the combined full text from all documents
+        full_document_text = "\n\n".join([doc["text"] for doc in documents])
+        
+        # Group indicators into batches
+        scoring_rules_to_process = {k: scoring_rules[k] for k in indices_to_process}
+        batches = list(chunk_dict(scoring_rules_to_process, BATCH_SIZE))
+        
+        semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        
+        async def process_batch(batch):
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    batch_start = time.time()
+                    async with semaphore:
+                        await asyncio.sleep(0.5)
+                        batch_results_list, token_count = await evaluate_indicator_batch(openai_client, full_document_text, batch)
+                    batch_time = time.time() - batch_start
                     
-                # Log the error but continue with other indicators
-                results[indicator_code] = {
-                    "score": 0,
-                    "title": indicator.get("disclosure", "Unknown"),
-                    "type": indicator.get("types", "Unknown"),
-                    "sub_type": indicator.get("sub-title", "Unknown"),
-                    "description": indicator.get("description", ""),
-                    "error": error_message
-                }
+                    return batch, batch_results_list, token_count, batch_time, None
+                except Exception as e:
+                    error_message = str(e)
+                    if "429" in error_message and attempt < max_retries - 1:
+                        await asyncio.sleep(5 * (attempt + 1))
+                        continue
+                    return batch, [], {"total_tokens": 0, "prompt_tokens": 0, "response_tokens": 0}, 0, error_message
+            return batch, [], {"total_tokens": 0, "prompt_tokens": 0, "response_tokens": 0}, 0, "Max retries exceeded"
+
+        # Run indicator batches concurrently
+        tasks = [process_batch(b) for b in batches]
+        batch_results = await asyncio.gather(*tasks)
+        
+        # Aggregate results
+        for batch_dict, res_list, t_count, b_time, err in batch_results:
+            if t_count.get("total_tokens"):
+                total_tokens_used += t_count["total_tokens"]
+                
+            # Create a lookup for results returned by AI
+            ai_lookup = {item.get("indicator_code"): item for item in res_list if isinstance(item, dict)}
+            
+            # Map back to our requested indicators
+            for code, indicator in batch_dict.items():
+                token_usage_by_indicator[code] = t_count
+                ai_processing_times[code] = round(b_time / len(batch_dict), 2) if len(batch_dict) > 0 else 0
+                
+                if err or code not in ai_lookup:
+                    results[code] = {
+                        "score": 0,
+                        "title": indicator.get("disclosure", "Unknown"),
+                        "type": indicator.get("types", "Unknown"),
+                        "sub_type": indicator.get("sub-title", "Unknown"),
+                        "description": indicator.get("description", ""),
+                        "error": err if err else "Missing from AI response"
+                    }
+                else:
+                    item = ai_lookup[code]
+                    results[code] = {
+                        "score": item.get("score", 0),
+                        "reasoning": item.get("reasoning", ""),
+                        "source_documents": [doc["filename"] for doc in documents],
+                        "title": indicator["disclosure"],
+                        "type": indicator["types"],
+                        "sub_type": indicator.get("sub-title", "Unknown"),
+                        "description": indicator.get("description", ""),
+                        "token_usage": t_count
+                    }
         
         ai_evaluation_time = time.time() - ai_evaluation_start
         
@@ -662,10 +738,10 @@ async def evaluate_multi_documents(
                 s3_object_key=file_details[0]["s3_object_key"],
                 file_size=file_details[0]["file_size"],
                 extraction_quality=file_details[0]["extraction_quality"],
-                results=results,
                 summary=summary,
                 token_usage=token_usage_by_indicator,
-                performance_metrics=timing_metrics
+                performance_metrics=timing_metrics,
+                user_id=request.user_id
             )
         else:
             document_id = None
@@ -909,7 +985,7 @@ async def extract_pdf_text(pdf_content):
             gemini_text = ""
             
             # Configure Gemini model for image processing
-            model = genai.GenerativeModel('gemini-1.5-pro')
+            model = genai.GenerativeModel('gemini-2.5-flash')
             
             # Process each page as an image
             for page_num in range(len(doc)):
@@ -934,29 +1010,60 @@ async def extract_pdf_text(pdf_content):
                     ])
                     gemini_text += response.text + "\n\n"
                 except Exception as e:
-                    print(f"Error processing page {page_num+1} with Gemini: {e}")
+                    print(f"Gemini OCR failed for page {page_num+1} ({e}). Falling back to OpenAI...")
+                    try:
+                        # Fallback to OpenAI vision
+                        response = await openai_client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": "Extract all text visible in this image. Format as plain text with paragraphs preserved."},
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:image/png;base64,{img_base64}"
+                                            }
+                                        }
+                                    ]
+                                }
+                            ],
+                            max_tokens=2000
+                        )
+                        gemini_text += response.choices[0].message.content + "\n\n"
+                    except Exception as openai_e:
+                        print(f"Error processing page {page_num+1} with OpenAI fallback: {openai_e}")
             
-            # Clean up temporary file
-            import os
-            os.unlink(temp_pdf_path)
+            doc.close()
             
             # If Gemini extracted text, use it. Otherwise, fall back to PyPDF2 results
             if len(gemini_text.strip()) > len(extracted_text.strip()):
                 return gemini_text
         except Exception as e:
             print(f"Error in image-based extraction: {e}")
+        finally:
+            # Clean up temporary file
+            import os
+            if os.path.exists(temp_pdf_path):
+                os.unlink(temp_pdf_path)
     
     # Return the best text we have (either PyPDF2 or Gemini)
     return extracted_text
 
 # Related to Database endpoints
 @app.get("/documents")
-async def list_documents(limit: int = 100, offset: int = 0):
+async def list_documents(limit: int = 100, offset: int = 0, user_id: Optional[str] = None):
     """Get a list of all analyzed documents with individual indicator scores and SPDI index"""
     try:
         with SessionLocal() as session:
             # Build base query for Documents
-            query = session.query(Document).order_by(Document.id.desc())
+            query = session.query(Document)
+            
+            if user_id:
+                query = query.filter(Document.user_id == user_id)
+                
+            query = query.order_by(Document.id.desc())
             
             # Get total count BEFORE pagination
             total_count = query.count()
