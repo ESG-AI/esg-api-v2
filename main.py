@@ -738,6 +738,7 @@ async def evaluate_multi_documents(
                 s3_object_key=file_details[0]["s3_object_key"],
                 file_size=file_details[0]["file_size"],
                 extraction_quality=file_details[0]["extraction_quality"],
+                results=results,
                 summary=summary,
                 token_usage=token_usage_by_indicator,
                 performance_metrics=timing_metrics,

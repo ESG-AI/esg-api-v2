@@ -70,7 +70,6 @@ The API will be available at `http://localhost:8000`.
 The API provides three different ways to access the documentation:
 
 1. **Interactive Swagger UI** (Recommended for testing)
-
    - Visit `http://localhost:8000/docs`
    - Features:
      - Interactive API testing
@@ -80,7 +79,6 @@ The API provides three different ways to access the documentation:
      - Example requests
 
 2. **ReDoc** (Recommended for reading)
-
    - Visit `http://localhost:8000/redoc`
    - Features:
      - Clean, responsive interface
@@ -148,9 +146,10 @@ curl -X POST http://localhost:8000/evaluate-multi -F "files=@report1.pdf,@report
 
 ### Batch Processing (Local)
 
-For testing and local evaluation, a standalone batch script (`batch_process.py`) is provided. This script evaluates a folder of PDFs simultaneously using OpenAI's model and outputs the individual indicator scores to a CSV file.
+For testing and local evaluation, a standalone batch script (`batch_process.py`) is provided. This script evaluates a folder of PDFs simultaneously using OpenAI's gpt-4o-mini model and outputs the individual indicator scores to a CSV file.
 
 To run batch scoring locally:
+
 1. Ensure you have a directory named `test_pdfs` in the root of the project.
 2. Put your input PDF files into the `test_pdfs` folder.
 3. Run the batch script command:
@@ -185,10 +184,12 @@ Each indicator has specific scoring criteria defined in the `scoring_rules.json`
 The system supports multiple AI models for evaluation:
 
 **OpenAI (Default):**
-- `gpt-4o-mini` (used for large batch processing)
+
+- `gpt-4o-mini` (used for all evaluation and batch processing)
 - `gpt-4o`
 
 **Google Gemini:**
+
 - `gemini-1.5-pro`
 
 These models are used for:
