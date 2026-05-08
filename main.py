@@ -12,6 +12,7 @@ from PIL import Image
 import base64
 import tempfile
 import time
+import uuid
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -22,7 +23,7 @@ from datetime import datetime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import JSONB
-from aws import upload_to_s3, get_pdf_from_s3
+from aws import upload_to_s3, get_pdf_from_s3, generate_presigned_upload_url
 import logging
 from pydantic import BaseModel
 
@@ -318,10 +319,14 @@ def check_extraction_quality(extracted_text, pdf_reader):
     
     return diagnostics
 
-@app.post("/upload")
+@app.post("/upload", deprecated=True)
 async def upload_pdf(pdf: UploadFile = File(...)):
     """
-    Upload a PDF to S3 and return the S3 object key.
+    [DEPRECATED — use GET /upload/presign instead]
+
+    Legacy endpoint: uploads a PDF through the backend server to S3 and returns the S3 object key.
+    This causes a bottleneck for large files because the entire file is buffered in memory and
+    re-uploaded to S3 server-side. Kept as a fallback only.
     """
     try:
         pdf_content = await pdf.read()
@@ -332,6 +337,33 @@ async def upload_pdf(pdf: UploadFile = File(...)):
         return {"s3_object_key": s3_object_key}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+
+@app.get("/upload/presign")
+async def get_upload_presigned_url(
+    filename: str = Query(..., description="Original filename of the PDF being uploaded"),
+    content_type: str = Query("application/pdf", description="MIME type of the file")
+):
+    """
+    Generate a presigned S3 PUT URL for direct client-to-S3 upload.
+
+    Flow:
+      1. Client calls this endpoint to obtain a presigned URL and a server-generated object_key.
+      2. Client PUTs the raw file bytes directly to S3 using the presigned URL (no backend involvement).
+      3. Client passes the object_key to POST /api/evaluate/enqueue to start analysis.
+
+    This eliminates the 50s upload bottleneck caused by routing large PDFs through the backend.
+    """
+    object_key = str(uuid.uuid4())
+    presigned_url = await generate_presigned_upload_url(object_key, content_type=content_type)
+    if not presigned_url:
+        raise HTTPException(status_code=500, detail="Failed to generate presigned upload URL")
+    return {
+        "presigned_url": presigned_url,
+        "object_key": object_key,
+        "expires_in": 900,
+        "filename": filename
+    }
 
 @app.get("/pdf/{s3_object_key:path}")
 async def get_pdf(s3_object_key: str):
