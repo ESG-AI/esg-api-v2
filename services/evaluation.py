@@ -22,7 +22,7 @@ import google.generativeai as genai
 import PyPDF2
 from PIL import Image
 
-from aws import get_pdf_from_s3
+from infrastructure.s3 import get_pdf_from_s3
 from config import BATCH_SIZE, CONCURRENCY_LIMIT, logger, openai_client
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ import PyPDF2
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 
 from auth.dependencies import get_current_user, require_paid
-from aws import get_pdf_from_s3
+from infrastructure.s3 import get_pdf_from_s3
 from db.models import User
 from config import BATCH_SIZE, CONCURRENCY_LIMIT, logger, openai_client, scoring_rules
 from schemas.evaluate import EvaluateMultiRequest, EvaluateRequest

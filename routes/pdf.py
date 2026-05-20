@@ -12,7 +12,7 @@ import uuid
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
-from aws import generate_presigned_upload_url, get_pdf_from_s3, upload_to_s3
+from infrastructure.s3 import generate_presigned_upload_url, get_pdf_from_s3, upload_to_s3
 
 router = APIRouter(tags=["PDF"])
 

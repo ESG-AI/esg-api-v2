@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from auth.dependencies import get_current_user, require_admin
-from aws import generate_presigned_url
+from infrastructure.s3 import generate_presigned_url
 from db.models import User, UserRole
 from db.repositories.analysis import update_indicator
 from db.repositories.document import get_all_documents, get_document_by_id
