@@ -19,7 +19,7 @@ from auth.dependencies import get_current_user, require_paid
 from aws import get_pdf_from_s3
 from db.models import User
 from config import BATCH_SIZE, CONCURRENCY_LIMIT, logger, openai_client, scoring_rules
-from schemas import EvaluateMultiRequest, EvaluateRequest
+from schemas.evaluate import EvaluateMultiRequest, EvaluateRequest
 from services.evaluation import (
     calculate_summary_scores,
     check_extraction_quality,

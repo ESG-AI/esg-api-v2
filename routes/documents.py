@@ -17,7 +17,7 @@ from aws import generate_presigned_url
 from db.models import User, UserRole
 from db.repositories.analysis import update_indicator
 from db.repositories.document import get_all_documents, get_document_by_id
-from schemas import UpdateAnalysisResultRequest
+from schemas.document import UpdateAnalysisResultRequest
 
 router = APIRouter(tags=["Documents"])
 

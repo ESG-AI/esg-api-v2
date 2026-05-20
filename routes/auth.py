@@ -12,10 +12,10 @@ Endpoints:
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr
 
 from auth.dependencies import get_current_user
 from auth.security import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
     create_access_token,
     create_refresh_token,
     hash_password,
@@ -30,49 +30,16 @@ from db.repositories.user import (
     revoke_refresh_token,
     save_refresh_token,
 )
+from schemas.auth import (
+    LoginRequest,
+    RefreshRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserResponse,
+)
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
-
-# ---------------------------------------------------------------------------
-# Request / Response schemas (auth-specific, kept local)
-# ---------------------------------------------------------------------------
-
-class RegisterRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    refresh_token: str
-    expires_in: int  # seconds
-
-
-class UserResponse(BaseModel):
-    id: int
-    email: str
-    role: str
-    is_active: bool
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterRequest):
@@ -115,7 +82,6 @@ async def login(body: LoginRequest):
     refresh_token, expires_at = create_refresh_token()
     save_refresh_token(user_id=user.id, token=refresh_token, expires_at=expires_at)
 
-    from auth.security import ACCESS_TOKEN_EXPIRE_MINUTES
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -150,7 +116,6 @@ async def refresh(body: RefreshRequest):
     new_refresh, expires_at = create_refresh_token()
     save_refresh_token(user_id=user.id, token=new_refresh, expires_at=expires_at)
 
-    from auth.security import ACCESS_TOKEN_EXPIRE_MINUTES
     return TokenResponse(
         access_token=new_access,
         refresh_token=new_refresh,

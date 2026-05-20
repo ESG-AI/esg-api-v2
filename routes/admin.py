@@ -4,44 +4,25 @@ routes/admin.py — Admin-only user management endpoints.
 All routes require role=admin (enforced via require_admin dependency).
 
 Endpoints:
-  GET   /admin/users              List all users
-  PATCH /admin/users/{id}/role    Set a user's role (free / paid / admin)
-  DELETE /admin/users/{id}        Deactivate a user account
+  GET    /admin/users              List all users
+  PATCH  /admin/users/{id}/role    Set a user's role (free / paid / admin)
+  DELETE /admin/users/{id}         Deactivate a user account
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
 
 from auth.dependencies import require_admin
-from db.models import User, UserRole
+from db.models import User
 from db.repositories.user import (
     deactivate_user,
     get_all_users,
-    get_user_by_id,
     revoke_all_user_tokens,
     update_user_role,
 )
+from schemas.admin import UpdateRoleRequest, UserSummary
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
-
-class UpdateRoleRequest(BaseModel):
-    role: UserRole
-
-
-class UserSummary(BaseModel):
-    id: int
-    email: str
-    role: str
-    is_active: bool
-
-    class Config:
-        from_attributes = True
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @router.get("/users")
 async def list_users(
@@ -83,7 +64,6 @@ async def set_user_role(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User {user_id} not found.",
         )
-    # Invalidate existing sessions so the role change applies immediately
     revoke_all_user_tokens(user_id)
     return user
 
