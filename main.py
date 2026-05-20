@@ -10,6 +10,8 @@ from routes.pdf import router as pdf_router
 from routes.evaluate import router as evaluate_router
 from routes.documents import router as documents_router
 from routes.utils import router as utils_router
+from routes.auth import router as auth_router
+from routes.admin import router as admin_router
 
 # ---------------------------------------------------------------------------
 # App
@@ -41,6 +43,8 @@ async def startup_db_client():
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
+app.include_router(auth_router)
+app.include_router(admin_router)
 app.include_router(pdf_router)
 app.include_router(evaluate_router)
 app.include_router(documents_router)

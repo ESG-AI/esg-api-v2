@@ -13,9 +13,11 @@ import time
 from typing import Optional
 
 import PyPDF2
-from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 
+from auth.dependencies import get_current_user, require_paid
 from aws import get_pdf_from_s3
+from db.models import User
 from config import BATCH_SIZE, CONCURRENCY_LIMIT, logger, openai_client, scoring_rules
 from schemas import EvaluateMultiRequest, EvaluateRequest
 from services.evaluation import (
@@ -33,7 +35,10 @@ router = APIRouter(tags=["Evaluate"])
 
 
 @router.post("/extract")
-async def extract_pdf(pdf: UploadFile = File(...)):
+async def extract_pdf(
+    pdf: UploadFile = File(...),
+    _: User = Depends(get_current_user),
+):
     """
     Extract text from a PDF and return detailed extraction diagnostics.
     This endpoint is for testing extraction quality without running the full
@@ -84,7 +89,10 @@ async def extract_pdf(pdf: UploadFile = File(...)):
 
 
 @router.post("/evaluate")
-async def evaluate_pdf(request: EvaluateRequest):
+async def evaluate_pdf(
+    request: EvaluateRequest,
+    _: User = Depends(require_paid),
+):
     start_time = time.time()
 
     if not request.s3_object_key:
@@ -117,6 +125,7 @@ async def evaluate_multi_documents(
     gri_type: Optional[str] = Query(
         None, description="One of: governance, economic, social, environmental"
     ),
+    _: User = Depends(require_paid),
 ):
     """
     Process multiple documents using existing S3 object keys with

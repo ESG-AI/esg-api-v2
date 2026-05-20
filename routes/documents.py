@@ -10,9 +10,11 @@ Endpoints:
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from auth.dependencies import get_current_user, require_admin
 from aws import generate_presigned_url
+from db.models import User, UserRole
 from db.repositories.analysis import update_indicator
 from db.repositories.document import get_all_documents, get_document_by_id
 from schemas import UpdateAnalysisResultRequest
@@ -24,15 +26,20 @@ router = APIRouter(tags=["Documents"])
 async def list_documents(
     limit: int = 100,
     offset: int = 0,
-    user_id: Optional[str] = None,
+    user: User = Depends(get_current_user),
 ):
-    """Get a paginated list of analyzed documents with indicator scores and SPDI index."""
-    documents, total_count = get_all_documents(limit=limit, offset=offset, user_id=user_id)
+    """Get a paginated list of analyzed documents. Admins see all; others see only their own."""
+    # Admins can see every document; regular users see only their own
+    filter_user_id = None if user.role == UserRole.admin else str(user.id)
+    documents, total_count = get_all_documents(limit=limit, offset=offset, user_id=filter_user_id)
     return {"documents": documents, "count": total_count}
 
 
 @router.get("/documents/{document_id}")
-async def get_document(document_id: int):
+async def get_document(
+    document_id: int,
+    _: User = Depends(get_current_user),
+):
     """Get the complete analysis results for a document."""
     document = get_document_by_id(document_id)
     if not document:
@@ -44,7 +51,10 @@ async def get_document(document_id: int):
 
 
 @router.get("/documents/{document_id}/pdf")
-async def get_document_pdf(document_id: int):
+async def get_document_pdf(
+    document_id: int,
+    _: User = Depends(get_current_user),
+):
     """Get a presigned URL to access the original PDF."""
     try:
         document = get_document_by_id(document_id)
@@ -70,6 +80,7 @@ async def update_analysis_result(
     document_id: int,
     indicator_code: str,
     update: UpdateAnalysisResultRequest,
+    _: User = Depends(require_admin),
 ):
     """Update the score and/or reasoning for a specific indicator on a document."""
     return update_indicator(
