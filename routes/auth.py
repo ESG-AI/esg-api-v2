@@ -9,9 +9,12 @@ Endpoints:
   GET  /auth/me         Return the current user's profile
 """
 
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+
+logger = logging.getLogger(__name__)
 
 from auth.dependencies import get_current_user
 from auth.security import (
@@ -48,6 +51,7 @@ async def register(body: RegisterRequest):
     Returns the created user profile (no tokens — user must log in separately).
     """
     if get_user_by_email(body.email):
+        logger.warning(f"Registration failed: Email {body.email} already exists.")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists.",
@@ -55,6 +59,7 @@ async def register(body: RegisterRequest):
 
     hashed = hash_password(body.password)
     user = create_user(email=body.email, hashed_password=hashed)
+    logger.info(f"User registration request succeeded for email: {body.email}")
     return user
 
 
@@ -66,11 +71,13 @@ async def login(body: LoginRequest):
     """
     user = get_user_by_email(body.email)
     if not user or not verify_password(body.password, user.hashed_password):
+        logger.warning(f"Login failed: Invalid credentials for email {body.email}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
         )
     if not user.is_active:
+        logger.warning(f"Login failed: Deactivated account access attempt by email {body.email}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This account has been deactivated.",
@@ -82,6 +89,7 @@ async def login(body: LoginRequest):
     refresh_token, expires_at = create_refresh_token()
     save_refresh_token(user_id=user.id, token=refresh_token, expires_at=expires_at)
 
+    logger.info(f"User login successful for email: {body.email} (ID: {user.id})")
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -98,6 +106,7 @@ async def refresh(body: RefreshRequest):
     rt = get_refresh_token(body.refresh_token)
 
     if not rt or rt.revoked or rt.expires_at < datetime.utcnow():
+        logger.warning("Token refresh failed: Invalid, revoked, or expired refresh token.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token.",
@@ -105,6 +114,7 @@ async def refresh(body: RefreshRequest):
 
     user = get_user_by_id(rt.user_id)
     if not user or not user.is_active:
+        logger.warning(f"Token refresh failed: User (ID: {rt.user_id if rt else 'Unknown'}) not found or inactive.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive.",
@@ -116,6 +126,7 @@ async def refresh(body: RefreshRequest):
     new_refresh, expires_at = create_refresh_token()
     save_refresh_token(user_id=user.id, token=new_refresh, expires_at=expires_at)
 
+    logger.info(f"Token rotated successfully for user email: {user.email} (ID: {user.id})")
     return TokenResponse(
         access_token=new_access,
         refresh_token=new_refresh,
@@ -124,9 +135,10 @@ async def refresh(body: RefreshRequest):
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(body: RefreshRequest, _: User = Depends(get_current_user)):
+async def logout(body: RefreshRequest, user: User = Depends(get_current_user)):
     """Revoke the provided refresh token (log out this device/session)."""
     revoke_refresh_token(body.refresh_token)
+    logger.info(f"User logged out successfully: {user.email} (ID: {user.id})")
 
 
 @router.get("/me", response_model=UserResponse)

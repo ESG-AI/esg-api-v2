@@ -17,13 +17,16 @@ import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
+import logging
 import fitz
 import google.generativeai as genai
 import PyPDF2
 from PIL import Image
 
 from infrastructure.s3 import get_pdf_from_s3
-from config import BATCH_SIZE, CONCURRENCY_LIMIT, logger, openai_client
+from config import BATCH_SIZE, CONCURRENCY_LIMIT, openai_client
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # In-memory text cache (avoids redundant S3 downloads + OCR within a session)
@@ -331,10 +334,10 @@ async def get_cached_extracted_text(s3_key: str):
 
     async with cache_locks[s3_key]:
         if s3_key in TEXT_CACHE:
-            print(f"Using cached OCR text for {s3_key}")
+            logger.info(f"Using cached OCR text for {s3_key}")
             return TEXT_CACHE[s3_key]["text"], TEXT_CACHE[s3_key]["content"]
 
-        print(f"Downloading and extracting {s3_key}")
+        logger.info(f"Downloading and extracting {s3_key}")
         pdf_content = await get_pdf_from_s3(s3_key)
         if not pdf_content:
             return None, None
@@ -536,7 +539,7 @@ async def extract_pdf_text(pdf_content: bytes) -> str:
     )
 
     if avg_chars_per_page < 200:
-        print(
+        logger.info(
             f"Detected potential scanned PDF (avg {avg_chars_per_page:.2f} chars/page). "
             "Using Gemini for image processing..."
         )
@@ -572,7 +575,7 @@ async def extract_pdf_text(pdf_content: bytes) -> str:
                     )
                     gemini_text += response.text + "\n\n"
                 except Exception as e:
-                    print(
+                    logger.warning(
                         f"Gemini OCR failed for page {page_num + 1} ({e}). "
                         "Falling back to OpenAI..."
                     )
@@ -600,14 +603,14 @@ async def extract_pdf_text(pdf_content: bytes) -> str:
                         )
                         gemini_text += response.choices[0].message.content + "\n\n"
                     except Exception as openai_e:
-                        print(f"Error processing page {page_num + 1} with OpenAI fallback: {openai_e}")
+                        logger.error(f"Error processing page {page_num + 1} with OpenAI fallback: {openai_e}")
 
             doc.close()
 
             if len(gemini_text.strip()) > len(extracted_text.strip()):
                 return gemini_text
         except Exception as e:
-            print(f"Error in image-based extraction: {e}")
+            logger.error(f"Error in image-based extraction: {e}")
         finally:
             if os.path.exists(temp_pdf_path):
                 os.unlink(temp_pdf_path)

@@ -7,12 +7,15 @@ Endpoints:
   GET  /pdf/{s3_object_key:path}  Stream a PDF from S3
 """
 
+import logging
 import uuid
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
 from infrastructure.s3 import generate_presigned_upload_url, get_pdf_from_s3, upload_to_s3
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["PDF"])
 
@@ -31,9 +34,12 @@ async def upload_pdf(pdf: UploadFile = File(...)):
         pdf_content = await pdf.read()
         s3_object_key = await upload_to_s3(pdf_content, pdf.filename)
         if not s3_object_key:
+            logger.error(f"Legacy upload failed: S3 upload returned no object key for {pdf.filename}")
             raise HTTPException(status_code=500, detail="Failed to upload document to S3")
+        logger.info(f"Legacy upload succeeded for {pdf.filename} -> S3 key: {s3_object_key}")
         return {"s3_object_key": s3_object_key}
     except Exception as e:
+        logger.error(f"Legacy upload failed for {pdf.filename}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
 
 
@@ -57,9 +63,12 @@ async def get_upload_presigned_url(
     through the backend.
     """
     object_key = str(uuid.uuid4())
+    logger.info(f"Generating presigned upload URL for file {filename} (S3 key: {object_key})")
     presigned_url = await generate_presigned_upload_url(object_key, content_type=content_type)
     if not presigned_url:
+        logger.error(f"Failed to generate presigned upload URL for {filename} (key: {object_key})")
         raise HTTPException(status_code=500, detail="Failed to generate presigned upload URL")
+    logger.info(f"Successfully generated presigned upload URL for {filename} (key: {object_key})")
     return {
         "presigned_url": presigned_url,
         "object_key": object_key,
@@ -72,9 +81,15 @@ async def get_upload_presigned_url(
 async def get_pdf(s3_object_key: str):
     """Retrieve a PDF from S3 and return it directly as a file response."""
     try:
+        logger.info(f"Request to fetch PDF from S3: {s3_object_key}")
         pdf_content = await get_pdf_from_s3(s3_object_key)
         if not pdf_content:
+            logger.warning(f"PDF not found in S3 for key: {s3_object_key}")
             raise HTTPException(status_code=404, detail="PDF not found in S3")
+        logger.info(f"Successfully retrieved PDF from S3 for key: {s3_object_key} ({len(pdf_content)} bytes)")
         return Response(content=pdf_content, media_type="application/pdf")
+    except HTTPException as he:
+        raise he
     except Exception as e:
+        logger.error(f"Error retrieving PDF for S3 key {s3_object_key}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error retrieving PDF: {str(e)}")
