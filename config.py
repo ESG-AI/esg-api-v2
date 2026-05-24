@@ -38,8 +38,11 @@ with open("scoring_rules.json", "r") as f:
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler("gemini_prompts.log"),

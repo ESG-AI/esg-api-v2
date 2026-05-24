@@ -8,10 +8,13 @@ repository.
 
 from __future__ import annotations
 
+import logging
 from fastapi import HTTPException
 
 from db.models import AnalysisResult, ScoreSummary
 from db.session import SessionLocal
+
+logger = logging.getLogger(__name__)
 
 
 def update_indicator(
@@ -78,16 +81,29 @@ def update_indicator(
 
         db.commit()
 
+        logger.info(
+            f"Successfully updated AnalysisResult and recalculated SPDI for document "
+            f"{document_id}, indicator {indicator_code}."
+        )
+
         return {
             "success": True,
             "message": f"AnalysisResult updated successfully for indicator {indicator_code}",
             "updated_spdi_index": total_spdi,
         }
 
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        logger.warning(
+            f"HTTPException updating analysis result for document {document_id}, "
+            f"indicator {indicator_code}: {he.detail}"
+        )
+        raise he
     except Exception as e:
         db.rollback()
+        logger.error(
+            f"Failed to update analysis result for document {document_id}, "
+            f"indicator {indicator_code}: {str(e)}"
+        )
         raise HTTPException(
             status_code=500, detail=f"Error updating analysis result: {str(e)}"
         )

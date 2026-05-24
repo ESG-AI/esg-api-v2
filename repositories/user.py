@@ -4,10 +4,13 @@ db/repositories/user.py — CRUD for User and RefreshToken models.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from db.models import RefreshToken, User, UserRole
 from db.session import SessionLocal
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -22,9 +25,11 @@ def create_user(email: str, hashed_password: str) -> User:
         db.add(user)
         db.commit()
         db.refresh(user)
+        logger.info(f"Successfully created user with email: {email}")
         return user
-    except Exception:
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to create user with email {email}: {str(e)}")
         raise
     finally:
         db.close()
@@ -52,13 +57,16 @@ def update_user_role(user_id: int, role: UserRole) -> User | None:
     try:
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
+            logger.warning(f"User {user_id} not found when updating role to {role}")
             return None
         user.role = role
         db.commit()
         db.refresh(user)
+        logger.info(f"Successfully updated role to {role} for user_id {user_id}")
         return user
-    except Exception:
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to update role to {role} for user_id {user_id}: {str(e)}")
         raise
     finally:
         db.close()
@@ -70,12 +78,15 @@ def deactivate_user(user_id: int) -> bool:
     try:
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
+            logger.warning(f"User {user_id} not found when trying to deactivate")
             return False
         user.is_active = False
         db.commit()
+        logger.info(f"Successfully deactivated user_id {user_id}")
         return True
-    except Exception:
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to deactivate user_id {user_id}: {str(e)}")
         raise
     finally:
         db.close()
@@ -101,8 +112,10 @@ def save_refresh_token(user_id: int, token: str, expires_at: datetime) -> None:
     try:
         db.add(RefreshToken(user_id=user_id, token=token, expires_at=expires_at))
         db.commit()
-    except Exception:
+        logger.info(f"Successfully saved refresh token for user_id {user_id}")
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to save refresh token for user_id {user_id}: {str(e)}")
         raise
     finally:
         db.close()
@@ -124,8 +137,12 @@ def revoke_refresh_token(token: str) -> None:
         if rt:
             rt.revoked = True
             db.commit()
-    except Exception:
+            logger.info("Successfully revoked refresh token")
+        else:
+            logger.warning("Attempted to revoke non-existent refresh token")
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to revoke refresh token: {str(e)}")
         raise
     finally:
         db.close()
@@ -135,13 +152,15 @@ def revoke_all_user_tokens(user_id: int) -> None:
     """Revoke every active refresh token for a user (logout-all / ban)."""
     db = SessionLocal()
     try:
-        db.query(RefreshToken).filter(
+        count = db.query(RefreshToken).filter(
             RefreshToken.user_id == user_id,
             RefreshToken.revoked == False,  # noqa: E712
         ).update({"revoked": True})
         db.commit()
-    except Exception:
+        logger.info(f"Successfully revoked {count} refresh tokens for user_id {user_id}")
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to revoke refresh tokens for user_id {user_id}: {str(e)}")
         raise
     finally:
         db.close()

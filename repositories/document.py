@@ -7,8 +7,12 @@ so they live in the same repository.
 
 from __future__ import annotations
 
+import logging
+
 from db.models import AnalysisResult, Document, ScoreSummary
 from db.session import SessionLocal
+
+logger = logging.getLogger(__name__)
 
 
 def save_analysis_results(
@@ -141,10 +145,12 @@ def save_analysis_results(
             )
             db.commit()
 
+        logger.info(f"Successfully saved analysis results for document: {filename} (ID: {document.id})")
         return document.id
 
-    except Exception:
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to save analysis results for document {filename}: {str(e)}")
         raise
     finally:
         db.close()
@@ -244,5 +250,5 @@ def get_all_documents(
             return result, total_count
 
     except Exception as e:
-        print(f"Error getting documents: {e}")
+        logger.error(f"Error getting documents: {e}")
         return [], 0
