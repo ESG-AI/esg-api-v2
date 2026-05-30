@@ -5,3 +5,11 @@ __pycache__/
 .env
 gemini_prompts.log
 .DS_Store
+
+# AI
+.antigravitycli
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/

@@ -134,6 +134,26 @@ To run batch scoring locally:
    ```
 4. Once completed, the result will be saved as a `batch_results.csv` file in the project root containing the evaluation scores for each document.
 
+### Running Tests
+
+We use `pytest` along with `pytest-cov` for testing. The test suite automatically runs against an isolated in-memory SQLite database, meaning no database configuration is required to execute tests.
+
+To run all unit and integration tests with coverage:
+
+```bash
+uv run pytest -v --cov=.
+```
+
+To generate and view an interactive HTML coverage report in your browser:
+
+```bash
+# Run tests and generate HTML report files
+uv run pytest -v --cov=. --cov-report=html
+
+# Open report in your browser (macOS)
+open htmlcov/index.html
+```
+
 ## Scoring System
 
 The scoring system is based on the GRI standards framework and uses a 0-4 scale:
