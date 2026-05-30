@@ -1,0 +1,49 @@
+[project]
+name = "esg-scoring-backend-v2"
+version = "0.1.0"
+description = "A powerful backend service for automated ESG scoring of corporate sustainability reports using AI analysis."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.12",
+    "uvicorn>=0.34.0",
+    "gunicorn>=23.0.0",
+    "python-multipart>=0.0.20",
+    "starlette>=0.46.1",
+    "openai>=1.77.0",
+    "google-generativeai>=0.3.2",
+    "PyMuPDF>=1.25.5",
+    "PyPDF2>=3.0.1",
+    "pillow>=11.1.0",
+    "boto3>=1.37.33",
+    "botocore>=1.37.33",
+    "SQLAlchemy>=2.0.40",
+    "psycopg2-binary>=2.9.10",
+    "alembic>=1.15.2",
+    "pydantic>=2.13.2",
+    "passlib[bcrypt]>=1.7.4",
+    "python-jose[cryptography]>=3.3.0",
+    "email-validator>=2.2.0",
+    "python-dotenv>=1.1.0",
+    "httpx>=0.28.1",
+    "requests>=2.32.3",
+    "bcrypt<4.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = "test_*.py"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+

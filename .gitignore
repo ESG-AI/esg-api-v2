@@ -1,6 +1,15 @@
+.venv/
 venv/
 __pycache__/
 *.pyc
 .env
 gemini_prompts.log
 .DS_Store
+
+# AI
+.antigravitycli
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/

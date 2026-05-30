@@ -23,6 +23,7 @@ This project provides an API for evaluating sustainability reports and other cor
 ### Prerequisites
 
 - Python 3.10+
+- [uv](https://github.com/astral-sh/uv) (fast Python package and project manager)
 - PostgreSQL database (or Neon.tech account)
 - AWS S3 bucket
 - OpenAI API key
@@ -30,24 +31,30 @@ This project provides an API for evaluating sustainability reports and other cor
 
 ### Setup
 
-1. Clone the repository:
+1. Install `uv` if you haven't already:
+
+   - **macOS/Linux:**
+     ```bash
+     curl -LsSf https://astral.sh/uv/install.sh | sh
+     ```
+     *(Or via Homebrew: `brew install uv`)*
+
+   - **Windows:**
+     ```powershell
+     powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+     ```
+
+2. Clone the repository:
 
    ```bash
    git clone https://github.com/ESG-AI/esg-api-v2.git
    cd esg-api-v2
    ```
 
-2. Create and activate a virtual environment:
+3. Install dependencies and set up the virtual environment:
 
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. Install dependencies:
-
-   ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
 
 4. Set up environment variables:  
@@ -57,10 +64,10 @@ This project provides an API for evaluating sustainability reports and other cor
 
 ### Running the Server
 
-Start the development server:
+Start the development server using `uv run`:
 
 ```bash
-uvicorn main:app --reload
+uv run uvicorn main:app --reload
 ```
 
 The API will be available at `http://localhost:8000`.
@@ -105,44 +112,13 @@ curl -H "X-API-Key: your-api-key" http://localhost:8000/your-endpoint
 
 #### Example: Using the Documentation
 
-1. Start the server: `uvicorn main:app --reload`
+1. Start the server: `uv run uvicorn main:app --reload`
 2. Open `http://localhost:8000/docs` in your browser
 3. Click on any endpoint to expand its details
 4. Click "Try it out" to test the endpoint
 5. Fill in the required parameters
 6. Click "Execute" to make the request
 7. View the response and status code
-
-### API Endpoints
-
-#### Document Analysis
-
-- `POST /extract`: Extract text from a PDF with quality diagnostics
-- `POST /evaluate`: Evaluate a single PDF against all ESG indicators
-- `POST /evaluate-multi`: Process multiple documents with specified document types
-
-#### Document Management
-
-- `GET /documents`: List all analyzed documents
-- `GET /documents/{document_id}`: Get complete analysis results for a document
-- `GET /documents/{document_id}/pdf`: Get a presigned URL to access the original PDF
-
-#### Utility Endpoints
-
-- `GET /scoring-rules`: Return all scoring rules
-- `GET /categories`: Return all available ESG categories
-
-### Example: Evaluating a Document
-
-```bash
-curl -X POST http://localhost:8000/evaluate -F "file=@sustainability_report.pdf"
-```
-
-### Example: Multi-document Evaluation
-
-```bash
-curl -X POST http://localhost:8000/evaluate-multi -F "files=@report1.pdf,@report2.pdf"
-```
 
 ### Batch Processing (Local)
 
@@ -154,9 +130,29 @@ To run batch scoring locally:
 2. Put your input PDF files into the `test_pdfs` folder.
 3. Run the batch script command:
    ```bash
-   python batch_process.py
+   uv run python batch_process.py
    ```
 4. Once completed, the result will be saved as a `batch_results.csv` file in the project root containing the evaluation scores for each document.
+
+### Running Tests
+
+We use `pytest` along with `pytest-cov` for testing. The test suite automatically runs against an isolated in-memory SQLite database, meaning no database configuration is required to execute tests.
+
+To run all unit and integration tests with coverage:
+
+```bash
+uv run pytest -v --cov=.
+```
+
+To generate and view an interactive HTML coverage report in your browser:
+
+```bash
+# Run tests and generate HTML report files
+uv run pytest -v --cov=. --cov-report=html
+
+# Open report in your browser (macOS)
+open htmlcov/index.html
+```
 
 ## Scoring System
 
